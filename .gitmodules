@@ -1,3 +1,0 @@
-[submodule "chef-workstation/cookbooks"]
-	path = chef-workstation/cookbooks
-	url = https://github.com/hgilani/cookbooks.git
