@@ -1,0 +1,75 @@
+include "types.cf"
+include "OracleTypes.cf"
+
+cluster @CLUSTER@ (
+@USEFENCE@)
+
+system @NODE1@ (
+)
+system @NODE2@ (
+)
+
+group ora_sg (
+    SystemList = { @NODE1@ = 0, @NODE2@ = 1 }
+    AutoStartList = { @NODE1@, @NODE2@ }
+    Parallel = 0
+)
+
+LVMVolumeGroup ora_vg (
+    VolumeGroup = @VG@
+    StartVolumes = 1
+    EnableLVMTagging = 1
+    ScanDevices = 1
+)
+
+NIC ora_nic (
+    Device = @CLIENT_NIC@
+    Mii = 1
+    NetworkHosts = { "@PEER_CLIENT_IP@" }
+)
+
+IP ora_ip (
+    Device = @CLIENT_NIC@
+    Address = "@SERVICE_IP@"
+    NetMask = "@NETMASK@"
+)
+
+Mount ora_mnt (
+    MountPoint = "@MOUNT_POINT@"
+    BlockDevice = "@BLOCK_DEVICE@"
+    FSType = ext4
+    MountOpt = rw
+    FsckOpt = "-y"
+)
+
+Oracle ora_db (
+    Sid = @SID@
+    Owner = oracle
+    Home = "@ORACLE_HOME@"
+    Pfile = "@ORACLE_HOME@/dbs/init@SID@.ora"
+    EnvFile = "/home/oracle/.oraenv_vcs"
+    StartUpOpt = STARTUP_FORCE
+    ShutDownOpt = IMMEDIATE
+    AutoEndBkup = 1
+)
+
+Netlsnr ora_lsnr (
+    Owner = oracle
+    Home = "@ORACLE_HOME@"
+    TnsAdmin = "@ORACLE_HOME@/network/admin"
+    Listener = LISTENER
+    EnvFile = "/home/oracle/.oraenv_vcs"
+)
+
+ora_sg contains ora_vg
+ora_sg contains ora_nic
+ora_sg contains ora_ip
+ora_sg contains ora_mnt
+ora_sg contains ora_db
+ora_sg contains ora_lsnr
+
+ora_mnt requires ora_vg
+ora_ip requires ora_nic
+ora_db requires ora_mnt
+ora_db requires ora_ip
+ora_lsnr requires ora_db

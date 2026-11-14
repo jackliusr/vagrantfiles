@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Convenience wrapper around the vagrant/virsh commands used by this lab.
+set -Eeuo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+usage() {
+  cat <<'EOF'
+Usage: ./lab <command> [args]
+
+  up                 start the iSCSI storage target and provision both nodes
+  cluster            create the VCS cluster (fencing + ora_sg) once both nodes run
+  status             show storage, fencing, cluster and database state
+  switch [node]      move ora_sg to the other node (default: vcs2)
+  online | offline   bring ora_sg online on vcs1 / take it offline
+  kill [node]        hard power off a node (fencing / failover demo, default vcs1)
+  start [node]       power a node back on
+  storage [cmd]      ./host/lio-target.sh setup|status|teardown (default: status)
+  provision NODE STEP  re-run one provisioning step (e.g. provision vcs1 vcs_install)
+  ssh [node]         open a shell on vcs1 (or the given node)
+  destroy            destroy both VMs, keeping the shared LUN images
+  clean              destroy the VMs and delete .storage/ and .runtime/
+EOF
+}
+
+storage() { sudo ./host/lio-target.sh "$@"; }
+
+case "${1:-help}" in
+  up)
+    storage setup
+    vagrant up
+    echo
+    echo "Both nodes are provisioned. Create the cluster with: ./lab cluster"
+    ;;
+  cluster)
+    vagrant ssh vcs1 -c 'sudo /home/vagrant/vcs-lab/scripts/07-vcs-config.sh'
+    ;;
+  status)
+    for node in vcs1 vcs2; do
+      vagrant ssh "$node" -c 'sudo /home/vagrant/vcs-lab/scripts/08-status.sh'
+      echo
+    done
+    ;;
+  switch)
+    target=${2:-vcs2}
+    vagrant ssh vcs1 -c "sudo /opt/VRTSvcs/bin/hagrp -switch ora_sg -to $target"
+    ;;
+  online)
+    vagrant ssh vcs1 -c 'sudo /opt/VRTSvcs/bin/hagrp -online ora_sg -sys vcs1'
+    ;;
+  offline)
+    vagrant ssh vcs1 -c 'sudo /opt/VRTSvcs/bin/hagrp -offline ora_sg -sys vcs1'
+    ;;
+  kill)
+    vagrant halt --force "${2:-vcs1}"
+    ;;
+  start)
+    vagrant up "${2:-vcs1}" --no-provision
+    ;;
+  storage)
+    shift
+    storage "${@:-status}"
+    ;;
+  provision)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    vagrant provision "$2" --provision-with "$3"
+    ;;
+  ssh)
+    vagrant ssh "${2:-vcs1}"
+    ;;
+  destroy)
+    vagrant destroy -f
+    ;;
+  clean)
+    vagrant destroy -f
+    storage teardown --purge
+    rm -rf .runtime
+    echo "storage images and generated keys removed"
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
