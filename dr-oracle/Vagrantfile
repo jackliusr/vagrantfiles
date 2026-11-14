@@ -1,0 +1,227 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Oracle Database disaster recovery lab: two data centres, each with its own
+# SAN array, built with Vagrant on libvirt/QEMU. The arrays are Linux VMs that
+# export LUNs over iSCSI (targetcli) and replicate them block-by-block with
+# DRBD, which is how an SRDF/SnapMirror/ActiveDR pair behaves from Oracle's
+# point of view. See README.md for the topology, usage and the DR runbooks.
+
+require "fileutils"
+
+LAB_DIR         = File.expand_path(__dir__)
+BOX             = ENV.fetch("DR_LAB_BOX", "generic/oracle8")
+ORACLE_SID      = ENV.fetch("DR_LAB_SID", "orcl")
+SERVICE_IP      = ENV.fetch("DR_LAB_VIP", "10.50.40.100")
+ORACLE_PASSWORD = ENV.fetch("DR_LAB_ORACLE_PASSWORD", "Oracle123")
+WAN_DELAY       = ENV.fetch("DR_LAB_WAN_DELAY", "5ms")
+DATA_MB         = Integer(ENV.fetch("DR_LAB_DATA_MB", "12288"))
+FRA_MB          = Integer(ENV.fetch("DR_LAB_FRA_MB", "6144"))
+
+# Isolated layer-2 segments. Every segment is its own libvirt network so the
+# two SAN fabrics are genuinely separate: the DB host at site A has no route to
+# the array at site B and vice versa.
+NETWORKS = {
+  san_a: { name: "dr-san-a", host_ip: "10.50.10.1" },
+  san_b: { name: "dr-san-b", host_ip: "10.50.20.1" },
+  repl:  { name: "dr-repl",  host_ip: "10.50.30.1" },
+  app:   { name: "dr-app",   host_ip: "10.50.40.1" },
+}.freeze
+
+SITES = {
+  "a" => {
+    db: "db1", san: "san1",
+    san_fe_ip: "10.50.10.10", db_san_ip: "10.50.10.21",
+    repl_ip:   "10.50.30.11", app_ip:    "10.50.40.11",
+    iqn:       "iqn.2026-11.lab.dr:san-a",
+    mac: { san_fe: "525400C0A110", db_san: "525400C0A121",
+           repl:   "525400C0B110", app:    "525400C0C111" },
+  },
+  "b" => {
+    db: "db2", san: "san2",
+    san_fe_ip: "10.50.20.10", db_san_ip: "10.50.20.21",
+    repl_ip:   "10.50.30.12", app_ip:    "10.50.40.12",
+    iqn:       "iqn.2026-11.lab.dr:san-b",
+    mac: { san_fe: "525400C0A210", db_san: "525400C0A221",
+           repl:   "525400C0B210", app:    "525400C0C221" },
+  },
+}.freeze
+
+def mac_with_colons(mac)
+  mac.scan(/../).join(":")
+end
+
+def other_site(site)
+  SITES.key?(site) && site == "a" ? "b" : "a"
+end
+
+# Environment shared by every machine, then the role-specific part.
+def base_env(name, role, site)
+  peer_site = other_site(site)
+  {
+    "LAB_NODE"      => name,
+    "LAB_ROLE"      => role,
+    "LAB_SITE"      => site,
+    "LAB_ORACLE_SID" => ORACLE_SID,
+    "LAB_SERVICE_IP" => SERVICE_IP,
+    "LAB_PEER_SITE" => peer_site,
+    "LAB_DATA_MB"   => DATA_MB.to_s,
+    "LAB_FRA_MB"    => FRA_MB.to_s,
+    "LAB_WAN_DELAY" => WAN_DELAY,
+  }
+end
+
+def array_env(name, site)
+  peer = SITES.fetch(other_site(site))
+  env = base_env(name, "array", site)
+  env.merge(
+    "LAB_PEER"            => peer[:san],
+    "LAB_SAN_FE_IP"       => SITES[site][:san_fe_ip],
+    "LAB_PEER_SAN_FE_IP"  => peer[:san_fe_ip],
+    "LAB_REPL_IP"         => SITES[site][:repl_ip],
+    "LAB_PEER_REPL_IP"    => peer[:repl_ip],
+    "LAB_ISCSI_IQN"       => SITES[site][:iqn],
+    "LAB_DB_HOST_IP"      => SITES[site][:db_san_ip],
+    "LAB_SAN_MAC"         => mac_with_colons(SITES[site][:mac][:san_fe]),
+    "LAB_REPL_MAC"        => mac_with_colons(SITES[site][:mac][:repl]),
+  )
+end
+
+def db_env(name, site)
+  peer = SITES.fetch(other_site(site))
+  env = base_env(name, "db", site)
+  env.merge(
+    "LAB_SITE_ROLE"    => site == "a" ? "primary" : "standby",
+    "LAB_PEER"         => peer[:db],
+    "LAB_PEER_SAN_IP"  => peer[:san_fe_ip],
+    # LAB_SAN_IP is the array's address (what iSCSI talks to); LAB_DB_SAN_IP is
+    # this host's own address on the SAN fabric.
+    "LAB_DB_SAN_IP"    => SITES[site][:db_san_ip],
+    "LAB_PEER_APP_IP"  => peer[:app_ip],
+    "LAB_SAN_IP"       => SITES[site][:san_fe_ip],
+    "LAB_ISCSI_IQN"    => SITES[site][:iqn],
+    "LAB_APP_IP"       => SITES[site][:app_ip],
+    "LAB_ORACLE_PASSWORD" => ORACLE_PASSWORD,
+    "LAB_SAN_MAC"      => mac_with_colons(SITES[site][:mac][:db_san]),
+    "LAB_APP_MAC"      => mac_with_colons(SITES[site][:mac][:app]),
+  )
+end
+
+# Adapter 1 is always the libvirt management network (DHCP, used by Vagrant).
+# The lab adapters are static and configured by the provisioning scripts
+# through NetworkManager, matched by MAC address.
+MACHINES = SITES.flat_map do |site, s|
+  [
+    {
+      name: s[:san], role: "array", site: site,
+      memory: 2048, cpus: 2,
+      nets: [
+        [site == "a" ? :san_a : :san_b, s[:san_fe_ip], s[:mac][:san_fe]],
+        [:repl, s[:repl_ip], s[:mac][:repl]],
+      ],
+      disks: [["vdb", DATA_MB], ["vdc", FRA_MB]],
+      env: array_env(s[:san], site),
+    },
+    {
+      name: s[:db], role: "db", site: site,
+      memory: 6144, cpus: 2,
+      nets: [
+        [(site == "a" ? :san_a : :san_b), s[:db_san_ip], s[:mac][:db_san]],
+        [:app, s[:app_ip], s[:mac][:app]],
+      ],
+      disks: [],
+      env: db_env(s[:db], site),
+    },
+  ]
+end
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.boot_timeout = 1200
+  # Everything is uploaded with file provisioners; 9p is not available in the
+  # Oracle Linux kernels used by these boxes, so no shared folders.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  MACHINES.each do |machine_def|
+    config.vm.define machine_def[:name] do |machine|
+      machine.vm.hostname = machine_def[:name]
+
+      machine_def[:nets].each do |net_key, ip, mac|
+        net = NETWORKS.fetch(net_key)
+        machine.vm.network "private_network",
+          ip: ip, mac: mac, auto_config: false,
+          libvirt__network_name: net[:name],
+          libvirt__host_ip: net[:host_ip],
+          libvirt__forward_mode: "none",
+          libvirt__dhcp_enabled: false,
+          bridge_stp: false
+      end
+
+      machine.vm.provider :libvirt do |lv|
+        lv.driver = "kvm"
+        lv.memory = machine_def[:memory]
+        lv.cpus = machine_def[:cpus]
+        lv.graphics_type = "none"
+        lv.video_type = "vga"
+        lv.disk_bus = "virtio"
+        lv.nic_model_type = "virtio"
+        # The array appliances own the SAN LUNs as real block devices, which
+        # DRBD and targetcli can use directly.
+        machine_def[:disks].each do |device, size_mb|
+          lv.storage :file, size: "#{size_mb}M", device: device,
+            bus: "virtio", type: "qcow2", cache: "none"
+        end
+      end
+
+      machine.vm.provision "lab-scripts", type: "file",
+        source: "scripts", destination: "/home/vagrant/dr-lab/scripts"
+
+      if machine_def[:role] == "db"
+        # Follow symlinks and upload one file at a time: the media directory is
+        # git-ignored and may just point at another lab's copy of the zip.
+        Dir.glob(File.join(LAB_DIR, "software", "*")).sort.each do |path|
+          next unless File.file?(path)
+          next if File.basename(path) =~ /\A(README\.md|\.gitignore)\z/
+          machine.vm.provision "lab-media-#{File.basename(path)}", type: "file",
+            source: File.realpath(path),
+            destination: "/home/vagrant/dr-lab/software/#{File.basename(path)}"
+        end
+      end
+
+      env = machine_def[:env]
+
+      if machine_def[:role] == "array"
+        machine.vm.provision "array", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/01-array.sh", env: env
+        # Both arrays have to be up before DRBD can be configured and linked.
+        machine.vm.provision "drbd", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/02-drbd.sh",
+          env: env, run: "never"
+        machine.vm.provision "target", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/03-target.sh",
+          env: env, run: "never"
+      else
+        machine.vm.provision "base", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/04-db-base.sh", env: env
+        machine.vm.provision "oracle_prereq", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/05-oracle-prereq.sh", env: env
+        machine.vm.provision "oracle_install", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/06-oracle-install.sh", env: env
+        # Storage, database and DR readiness need the arrays to be configured.
+        machine.vm.provision "db_storage", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/07-db-storage.sh",
+          env: env, run: "never"
+        machine.vm.provision "oracle_database", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/08-oracle-database.sh",
+          env: env, run: "never"
+        machine.vm.provision "dr_prepare", type: "shell",
+          inline: "bash /home/vagrant/dr-lab/scripts/09-dr-prepare.sh",
+          env: env, run: "never"
+      end
+
+      machine.vm.provision "status", type: "shell",
+        inline: "bash /home/vagrant/dr-lab/scripts/10-status.sh",
+        env: env, run: "never"
+    end
+  end
+end

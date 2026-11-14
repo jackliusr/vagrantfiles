@@ -9,6 +9,7 @@ the larger labs wrap the common commands in a `./lab` helper.
 
 | Directory | What it builds | Provider / box | Provisioning |
 |-----------|----------------|----------------|--------------|
+| [dr-oracle](dr-oracle/) | Oracle 19c disaster-recovery lab: two data centres, each with its own iSCSI SAN array emulated by `targetcli`, block-replicated between the sites with DRBD (SRDF/SnapMirror/ActiveDR style) | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`10` via `./lab` |
 | [rhel-ha-oracle](rhel-ha-oracle/) | Two-node Red Hat HA cluster (Pacemaker + Corosync + `pcs`) with SBD fencing and an Oracle 19c single instance on shared iSCSI storage | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`07` via `./lab` |
 | [vcs-oracle](vcs-oracle/) | Two-node Veritas InfoScale (VCS) cluster with VXFEN I/O fencing and an Oracle 19c single instance on PR-capable iSCSI LUNs | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`08` via `./lab` |
 | [oracle-11g](oracle-11g/) | Single-node Oracle Database 11g R2 installation | VirtualBox, `boxcutter/oel66` | Puppet (`manifests/base.pp`, `oracle` module) |
@@ -16,9 +17,9 @@ the larger labs wrap the common commands in a `./lab` helper.
 | [puppet-template](puppet-template/) | Puppet walkthrough that pulls a module from Puppet Forge and installs Elasticsearch | VirtualBox, `ubuntu/trusty64` | `apt-update.sh`, `install-puppet-modules.sh`, Puppet |
 | [windows_2012_r2_standard](windows_2012_r2_standard/) | Windows Server 2012 R2 desktop VM | VirtualBox GUI, `opentable/win-2012r2-standard-amd64-nocm` | none (WinRM) |
 
-Each directory has its own README; the two cluster labs document their network
-layout, provisioning steps, verification, failover demos and troubleshooting in
-detail.
+Each directory has its own README; the labs built on libvirt document their
+network layout, provisioning steps, verification, failover demos and
+troubleshooting in detail.
 
 ## Cluster labs (libvirt)
 
@@ -83,6 +84,33 @@ Connect from the host or either node with
 In both labs `./lab` also supports `ssh [node]`, `provision NODE STEP`,
 `storage [setup|status|teardown]`, `destroy` (keeps the LUN images) and `clean`
 (deletes `.storage/` and `.runtime/` as well).
+
+## Disaster recovery lab (libvirt)
+
+### dr-oracle
+
+Oracle Database DR the storage-replication way: two data centres, each with its
+own SAN array, and the arrays copy every block between the sites. The arrays are
+Linux VMs (`targetcli` front end, DRBD back end) so both halves of a SAN
+replication product are visible and controllable, and the DR site recovers by
+opening the replicated filesystems and letting Oracle perform instance crash
+recovery.
+
+```bash
+cd dr-oracle
+ln -s ../../rhel-ha-oracle/software/LINUX.X64_193000_db_home.zip software/
+./lab up          # db1, db2, san1, san2 (~17 GB RAM)
+./lab storage     # DRBD link, iSCSI exports, LUNs on both hosts
+./lab database    # create the database at site A, validate the DR site
+./lab status      # DRBD roles, mounts, VIP, instance state
+./lab switchover  # planned DR: clean stop, demote, promote, open at site B
+./lab failover    # unplanned: power off site A, promote site B, crash recovery
+./lab recover     # resync the returned site and switch back
+```
+
+`./lab sql "select * from dr_test;"` queries the active site through the floating
+address `10.50.40.100:1521`, and `./lab mode async` / `./lab wan 20ms` show what
+asynchronous replication and a slow WAN do to the data-loss window.
 
 ## Other environments
 

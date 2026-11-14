@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# Convenience wrapper around the vagrant/drbd/sqlplus commands used by the lab.
+set -Eeuo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+GUEST_DIR=/home/vagrant/dr-lab
+SCRIPTS=$GUEST_DIR/scripts
+VIP=${DR_LAB_VIP:-10.50.40.100}
+SID=${DR_LAB_SID:-orcl}
+PASSWORD=${DR_LAB_ORACLE_PASSWORD:-Oracle123}
+
+usage() {
+  cat <<'EOF'
+Usage: ./lab <command> [args]
+
+  up                 create and provision the four VMs (two sites, two arrays)
+  oracle             upload the 19c media and install the Oracle home on both hosts
+  storage            DRBD links, iSCSI exports, LUNs on both database hosts
+  database           create the database at site A and validate the DR site
+  status             storage, replication, VIP and database state on all nodes
+  start | stop       open or close the database at the active site
+  switchover [--force]  planned DR: clean stop at the active site, move to the other
+  failover           unplanned DR: crash the active site, promote the DR site
+  recover            power the failed site back on, resync, then switch back to it
+  verify             run DRBD online verification of the DR copy (a few minutes)
+  mode sync|async    switch DRBD between synchronous and asynchronous replication
+  wan DELAY          change the replication-link delay (e.g. 5ms, 0 to disable)
+  sql [statement]    run a statement through the service address (default: dr_test)
+  ssh [node]         open a shell (db1, db2, san1, san2; default db1)
+  provision NODE STEP  re-run one provisioning step
+  destroy            destroy the four VMs
+  clean              destroy the VMs and remove .runtime/
+EOF
+}
+
+# Capture stdout only (used for state checks); the fog-libvirt warning that every
+# vagrant command prints on stderr is filtered out of the interactive paths.
+guest_out() { vagrant ssh "$1" -c "$2" 2>/dev/null; }
+guest_sh()  { vagrant ssh "$1" -c "sudo bash $SCRIPTS/$2" 2> >(grep -v libvirt_ip_command >&2); }
+action()    { guest_sh "$1" "dr-action.sh $2"; }
+
+array_of_db() { case $1 in db1) echo san1 ;; db2) echo san2 ;; *) return 1 ;; esac; }
+
+# Pulling the plug on one machine at a time: "vagrant halt" with several names
+# trips over vagrant-libvirt's port-forward step, and a data-centre loss should
+# not depend on a graceful shutdown anyway.
+power_off() {
+  local node=$1
+  if ! vagrant halt --force "$node" >/dev/null 2>&1; then
+    virsh -c qemu:///system destroy "dr-oracle_$node" >/dev/null 2>&1 || true
+  fi
+  printf '    %s is powered off\n' "$node"
+}
+
+reachable_array() {
+  local node
+  for node in san1 san2; do
+    if [ -n "$(guest_out "$node" 'hostname' 2>/dev/null)" ]; then
+      echo "$node"
+      return 0
+    fi
+  done
+  return 1
+}
+db_of_array() { case $1 in san1) echo db1 ;; san2) echo db2 ;; *) return 1 ;; esac; }
+other()       { case $1 in db1) echo db2 ;; db2) echo db1 ;; san1) echo san2 ;; san2) echo san1 ;; *) return 1 ;; esac; }
+
+# The array that currently holds the write role tells us which site is live.
+primary_array() {
+  local node role
+  for node in san1 san2; do
+    role=$(guest_out "$node" 'sudo drbdadm role ora_data 2>/dev/null' | tr -d '\r[:space:]')
+    if [ "$role" = "Primary" ]; then
+      echo "$node"
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_site() {
+  PRIMARY_ARRAY=$(primary_array) || {
+    echo "no array reports Primary - run ./lab storage first (or ./lab status)" >&2
+    exit 1
+  }
+  PRIMARY_DB=$(db_of_array "$PRIMARY_ARRAY")
+  DR_ARRAY=$(other "$PRIMARY_ARRAY")
+  DR_DB=$(other "$PRIMARY_DB")
+}
+
+case "${1:-help}" in
+  up)
+    vagrant up
+    echo
+    echo "All four nodes are provisioned. Next: ./lab storage"
+    ;;
+  oracle)
+    media=$(ls software/*.zip 2>/dev/null | head -n 1 || true)
+    if [ -z "$media" ]; then
+      echo "no Oracle media in software/ - put LINUX.X64_193000_db_home.zip there first" >&2
+      echo "(a symlink to another lab's copy is enough: ln -s ../../rhel-ha-oracle/software/LINUX.X64_193000_db_home.zip software/)" >&2
+      exit 1
+    fi
+    echo "==> Media: $media"
+    provisioners="lab-media-$(basename "$media"),oracle_install"
+    for node in db1 db2; do
+      echo "==> $node: uploading the media and installing the Oracle home"
+      vagrant provision "$node" --provision-with "$provisioners" ||
+        { echo "the Oracle installation failed on $node" >&2; exit 1; }
+    done
+    echo
+    echo "Both Oracle homes are installed. Next: ./lab database"
+    ;;
+  storage)
+    echo "==> Configuring DRBD on both arrays"
+    guest_sh san1 02-drbd.sh
+    guest_sh san2 02-drbd.sh
+    echo "==> Exporting the LUNs over iSCSI"
+    guest_sh san1 03-target.sh
+    guest_sh san2 03-target.sh
+    echo "==> Promoting site A and waiting for the initial synchronisation"
+    action san1 promote-array
+    for _ in $(seq 1 120); do
+      if action san1 check-sync >/dev/null 2>&1; then
+        echo "    replication is in sync"
+        break
+      fi
+      sleep 5
+    done
+    echo "==> Attaching the LUNs to the database hosts"
+    guest_sh db1 07-db-storage.sh
+    guest_sh db2 07-db-storage.sh
+    # Now that site A created the filesystems, read them back from the replica at
+    # site B: this is the block-level proof that the two arrays are in step.
+    echo "==> Replication status of the DR array"
+    action san2 verify-replica ||
+      echo "    WARNING: the two copies are not in sync yet, check ./lab status" >&2
+    echo
+    echo "Storage ready. Next: ./lab database"
+    ;;
+  database)
+    guest_sh db1 08-oracle-database.sh
+    guest_sh db2 09-dr-prepare.sh
+    echo
+    echo "Database running at site A. Try ./lab status and ./lab sql"
+    ;;
+  status)
+    if PRIMARY_ARRAY=$(primary_array 2>/dev/null); then
+      printf 'Active site: %s (array %s), DR site: %s\n' \
+        "$(db_of_array "$PRIMARY_ARRAY")" "$PRIMARY_ARRAY" "$(other "$(db_of_array "$PRIMARY_ARRAY")")"
+    fi
+    for node in db1 db2 san1 san2; do
+      guest_sh "$node" 10-status.sh
+      echo
+    done
+    ;;
+  start)
+    require_site
+    action "$PRIMARY_DB" start-db
+    ;;
+  stop)
+    require_site
+    action "$PRIMARY_DB" stop-db
+    ;;
+  switchover)
+    require_site
+    force=false
+    [ "${2:-}" = "--force" ] && force=true
+    if ! action "$PRIMARY_ARRAY" check-sync; then
+      if [ "$force" = true ]; then
+        echo "WARNING: switching over with an out-of-sync DR site (data loss)" >&2
+      else
+        echo "Refusing to switch over: the DR site is not fully in sync." >&2
+        echo "Wait for the resynchronisation, or re-run with --force to accept the loss." >&2
+        exit 1
+      fi
+    fi
+    echo "==> Stopping the database at $PRIMARY_DB"
+    action "$PRIMARY_DB" stop-db
+    echo "==> Demoting the array at site $PRIMARY_ARRAY"
+    action "$PRIMARY_ARRAY" demote-array
+    action "$PRIMARY_DB" rescan >/dev/null 2>&1 || true
+    echo "==> Promoting the array at site $DR_ARRAY"
+    action "$DR_ARRAY" promote-array
+    echo "==> Starting the database at $DR_DB"
+    action "$DR_DB" start-db
+    echo
+    echo "Switchover complete: the database now runs at $DR_DB"
+    ;;
+  failover)
+    if PRIMARY_ARRAY=$(primary_array); then
+      CRASH_ARRAY=$PRIMARY_ARRAY
+      CRASH_DB=$(db_of_array "$PRIMARY_ARRAY")
+      SURVIVOR_ARRAY=$(other "$PRIMARY_ARRAY")
+      SURVIVOR_DB=$(other "$CRASH_DB")
+    else
+      # The active site is already gone (a failover that was interrupted, or a
+      # second run): promote whatever is still running.
+      SURVIVOR_ARRAY=$(reachable_array) || {
+        echo "no array is reachable - start the VMs with ./lab up first" >&2
+        exit 1
+      }
+      SURVIVOR_DB=$(db_of_array "$SURVIVOR_ARRAY")
+      CRASH_ARRAY=$(other "$SURVIVOR_ARRAY")
+      CRASH_DB=$(other "$SURVIVOR_DB")
+      echo "no array reports Primary: assuming the active site ($CRASH_DB) is already down"
+    fi
+    echo "==> Crashing the active site ($CRASH_DB + $CRASH_ARRAY)"
+    power_off "$CRASH_DB"
+    power_off "$CRASH_ARRAY"
+    echo "==> Promoting the surviving array $SURVIVOR_ARRAY (breaking the mirror)"
+    action "$SURVIVOR_ARRAY" promote-array
+    echo "==> Opening the database at $SURVIVOR_DB (this includes crash recovery)"
+    action "$SURVIVOR_DB" start-db
+    echo
+    echo "Failover complete: the database now runs at $SURVIVOR_DB"
+    echo "Power the failed site back on with: ./lab recover"
+    ;;
+  recover)
+    require_site
+    echo "==> Powering the failed site back on ($DR_DB + $DR_ARRAY)"
+    vagrant up "$DR_DB" "$DR_ARRAY" --no-provision
+    echo "==> Waiting for $PRIMARY_ARRAY to resynchronise the returning array"
+    synced=false
+    for _ in $(seq 1 120); do
+      if action "$PRIMARY_ARRAY" check-sync >/dev/null 2>&1; then
+        synced=true
+        break
+      fi
+      sleep 5
+    done
+    if [ "$synced" != true ]; then
+      echo "The arrays did not resynchronise, see ./lab status" >&2
+      exit 1
+    fi
+    echo "    resynchronised"
+    echo "==> Switching back to site $DR_DB"
+    "${BASH_SOURCE[0]}" switchover
+    ;;
+  verify)
+    require_site
+    echo "==> Online verification of the DR copy on $DR_ARRAY"
+    action "$DR_ARRAY" "verify-replica --run"
+    ;;
+  mode)
+    [ $# -ge 2 ] || { usage; exit 2; }
+    for node in san1 san2; do
+      echo "==> $node"
+      action "$node" "mode $2" || true
+    done
+    ;;
+  wan)
+    [ $# -ge 2 ] || { usage; exit 2; }
+    for node in san1 san2; do
+      action "$node" "wan $2"
+    done
+    ;;
+  sql)
+    require_site
+    if [ -z "$(guest_out "$PRIMARY_DB" 'test -x /u01/app/oracle/product/19.0.0/dbhome_1/bin/sqlplus && echo yes')" ]; then
+      echo "the Oracle software is not installed on $PRIMARY_DB: run ./lab oracle, then ./lab database" >&2
+      exit 1
+    fi
+    statement=${2:-"select * from dr_test;"}
+    {
+      # SQL*Plus needs one statement per line and exits 0 even after a SQL error
+      # when it reads a script, so split on ";" and ask it to fail loudly.
+      echo "whenever sqlerror exit failure"
+      printf '%s\n' "$statement" | sed 's/;[[:space:]]*/;\n/g'
+      echo "exit"
+    } | vagrant ssh "$PRIMARY_DB" \
+      -c "sudo su - oracle -c 'sqlplus -s -L system/$PASSWORD@//$VIP:1521/$SID'"
+    ;;
+  ssh)
+    vagrant ssh "${2:-db1}"
+    ;;
+  provision)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    vagrant provision "$2" --provision-with "$3"
+    ;;
+  destroy)
+    vagrant destroy -f
+    ;;
+  clean)
+    vagrant destroy -f
+    rm -rf .runtime
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
