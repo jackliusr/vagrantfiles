@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Convenience wrapper around the vagrant/pcs commands used by this lab.
+set -Eeuo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+usage() {
+  cat <<'EOF'
+Usage: ./lab <command> [args]
+
+  up                 start the iSCSI storage target and provision both nodes
+  cluster            create the Pacemaker cluster, SBD fencing and the ora group
+  status             show storage, cluster, fencing and database state
+  switch [node]      relocate the ora group to a node (default: ha2)
+  crash [node]       hard power off a node (fencing / failover demo, default: ha1)
+  start [node]       power a node back on
+  storage [cmd]      ./host/lio-target.sh setup|status|teardown (default: status)
+  provision NODE STEP  re-run one provisioning step (e.g. provision ha1 oracle_install)
+  ssh [node]         open a shell on ha1 (or the given node)
+  destroy            destroy both VMs, keeping the shared LUN images
+  clean              destroy the VMs and delete .storage/ and .runtime/
+EOF
+}
+
+storage() { sudo ./host/lio-target.sh "$@"; }
+
+case "${1:-help}" in
+  up)
+    storage setup
+    vagrant up
+    echo
+    echo "Both nodes are provisioned. Create the cluster with: ./lab cluster"
+    ;;
+  cluster)
+    vagrant ssh ha1 -c 'sudo bash /home/vagrant/ha-lab/scripts/06-cluster.sh'
+    ;;
+  status)
+    for node in ha1 ha2; do
+      vagrant ssh "$node" -c 'sudo bash /home/vagrant/ha-lab/scripts/07-status.sh'
+      echo
+    done
+    ;;
+  switch)
+    target=${2:-ha2}
+    case "$target" in
+      ha1 | ha2) ;;
+      *) echo "unknown node: $target" >&2; exit 2 ;;
+    esac
+
+    # Number of group members that report a state, and how many are Started on
+    # the target. The group is only considered moved when all of them are there.
+    if ! vagrant ssh ha1 -c 'sudo pcs resource config ora' >/dev/null 2>&1; then
+      echo "there is no 'ora' resource group yet, run ./lab cluster first" >&2
+      exit 1
+    fi
+
+    group_state() {
+      vagrant ssh ha1 -c 'sudo pcs resource status ora' 2>/dev/null \
+        | grep -E 'Started|Starting|Stopping|Stopped|FAILED' || true
+    }
+    on_target() {
+      local state total started
+      state=$(group_state)
+      total=$(printf '%s\n' "$state" | grep -c . || true)
+      started=$(printf '%s\n' "$state" | grep -c "Started $target" || true)
+      [ "$total" -gt 0 ] && [ "$started" -eq "$total" ]
+    }
+
+    # Clear constraints and fail counts left behind by an earlier switch: a
+    # stale location constraint makes the next "pcs resource move" fail with
+    # "Requested item already exists", and an infinite fail count makes
+    # Pacemaker move the group back as soon as the new constraint is removed.
+    vagrant ssh ha1 -c 'sudo pcs resource clear ora' >/dev/null 2>&1 || true
+    vagrant ssh ha1 -c "sudo pcs resource cleanup ora --node $target" >/dev/null 2>&1 || true
+
+    if on_target; then
+      echo "the ora group already runs on $target"
+      exit 0
+    fi
+
+    # crm_resource refuses to move a resource to the node it already runs on,
+    # which is why the "already runs" check comes first. It can still complain
+    # while the group is half way through a migration, so treat a failure as a
+    # warning and let the wait loop below decide.
+    if ! vagrant ssh ha1 -c "sudo pcs resource move ora $target"; then
+      echo "pcs resource move reported an error, waiting for the group anyway" >&2
+    fi
+
+    moved=1
+    # Wait for the whole group, not just its first member: clearing the
+    # constraint while the group is still migrating makes Pacemaker start the
+    # remaining resources on the old node again.
+    for _ in $(seq 1 60); do
+      if on_target; then
+        moved=0
+        break
+      fi
+      sleep 5
+    done
+    # Drop the temporary location constraint once the group has moved.
+    vagrant ssh ha1 -c 'sudo pcs resource clear ora'
+    if [ "$moved" -ne 0 ]; then
+      echo "the ora group did not finish moving to $target, see ./lab status" >&2
+      exit 1
+    fi
+    ;;
+  crash)
+    vagrant halt --force "${2:-ha1}"
+    ;;
+  start)
+    vagrant up "${2:-ha1}" --no-provision
+    ;;
+  storage)
+    shift
+    if [ $# -eq 0 ]; then storage status; else storage "$@"; fi
+    ;;
+  provision)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    vagrant provision "$2" --provision-with "$3"
+    ;;
+  ssh)
+    vagrant ssh "${2:-ha1}"
+    ;;
+  destroy)
+    vagrant destroy -f
+    ;;
+  clean)
+    vagrant destroy -f
+    storage teardown --purge
+    rm -rf .runtime
+    echo "storage images and generated keys removed"
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

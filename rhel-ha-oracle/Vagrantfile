@@ -1,0 +1,149 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Two-node Red Hat High Availability (Pacemaker + Corosync + pcs) cluster
+# running an Oracle 19c instance on iSCSI storage, built with Vagrant and
+# libvirt/QEMU. Oracle Linux 8 is the default because the 19c base release
+# cannot be built on Oracle Linux 9 (glibc 2.34); see README.md.
+#
+# Prerequisites, installer media and usage are described in README.md.
+
+require "fileutils"
+
+LAB_DIR        = File.expand_path(__dir__)
+BOX            = ENV.fetch("HA_LAB_BOX", "generic/oracle8")
+CLUSTER_NAME   = ENV.fetch("HA_LAB_CLUSTER", "ha_lab")
+ORACLE_SID     = ENV.fetch("HA_LAB_SID", "orcl")
+SERVICE_IP     = ENV.fetch("HA_LAB_SERVICE_IP", "10.20.3.100")
+DATA_MB        = Integer(ENV.fetch("HA_LAB_DATA_MB", "8192"))
+SBD_MB         = Integer(ENV.fetch("HA_LAB_SBD_MB", "1024"))
+STORAGE_IP     = ENV.fetch("HA_LAB_STORAGE_IP", "10.20.3.1")
+STORAGE_IQN    = ENV.fetch("HA_LAB_ISCSI_IQN", "iqn.2026-11.lab.rhelha:storage")
+HACLUSTER_PASS = ENV.fetch("HA_LAB_HACLUSTER_PASS", "Hacluster123")
+
+# Shared root key pair: pcs host auth and the Oracle installation both need
+# passwordless root access between the nodes.
+LAB_ROOT_KEY = File.join(LAB_DIR, ".runtime", "lab_root_key")
+unless File.exist?(LAB_ROOT_KEY)
+  FileUtils.mkdir_p(File.dirname(LAB_ROOT_KEY), mode: 0o700)
+  ok = system("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "rhelha-lab-root", "-f", LAB_ROOT_KEY)
+  raise "could not generate #{LAB_ROOT_KEY}" unless ok
+end
+
+# Adapter 1 is the libvirt management network (DHCP, Vagrant uses it). The two
+# lab networks are static and set up by 01-base.sh through NetworkManager, so
+# each one has a fixed MAC address that maps to a role.
+NODES = [
+  {
+    name: "ha1", role: "primary",
+    cluster_ip: "10.20.1.11", cluster_mac: "525400BB0111",
+    client_ip: "10.20.3.11",  client_mac: "525400BB0311",
+  },
+  {
+    name: "ha2", role: "secondary",
+    cluster_ip: "10.20.1.12", cluster_mac: "525400BB0112",
+    client_ip: "10.20.3.12",  client_mac: "525400BB0312",
+  },
+].freeze
+
+def mac_with_colons(mac)
+  mac.scan(/../).join(":")
+end
+
+def lab_env(node, peer)
+  {
+    "LAB_NODE"           => node[:name],
+    "LAB_ROLE"           => node[:role],
+    "LAB_PEER"           => peer[:name],
+    "LAB_CLUSTER_NAME"   => CLUSTER_NAME,
+    "LAB_ORACLE_SID"     => ORACLE_SID,
+    "LAB_CLUSTER_IP"     => node[:cluster_ip],
+    "LAB_PEER_CLUSTER_IP" => peer[:cluster_ip],
+    "LAB_CLIENT_IP"      => node[:client_ip],
+    "LAB_PEER_CLIENT_IP" => peer[:client_ip],
+    "LAB_CLUSTER_MAC"    => mac_with_colons(node[:cluster_mac]),
+    "LAB_CLIENT_MAC"     => mac_with_colons(node[:client_mac]),
+    "LAB_SERVICE_IP"     => SERVICE_IP,
+    "LAB_DATA_MB"        => DATA_MB.to_s,
+    "LAB_SBD_MB"         => SBD_MB.to_s,
+    "LAB_STORAGE_IP"     => STORAGE_IP,
+    "LAB_STORAGE_IQN"    => STORAGE_IQN,
+    "LAB_HACLUSTER_PASS" => HACLUSTER_PASS,
+  }
+end
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.boot_timeout = 900
+  # Scripts, templates and media are uploaded with the file provisioner; no
+  # rsync/NFS/9p shared folder is needed.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  media = Dir.glob(File.join(LAB_DIR, "software", "*"))
+             .reject { |f| File.basename(f) =~ /\A(README\.md|\.gitignore)\z/ }
+
+  NODES.each do |node|
+    peer = NODES.find { |n| n[:name] != node[:name] }
+
+    config.vm.define node[:name] do |machine|
+      machine.vm.hostname = node[:name]
+
+      # Isolated layer-2 segments: the cluster network carries corosync, the
+      # client network carries the floating service address.
+      machine.vm.network "private_network",
+        ip: node[:cluster_ip], mac: node[:cluster_mac], auto_config: false,
+        libvirt__network_name: "ha-cluster",
+        libvirt__host_ip: "10.20.1.1",
+        libvirt__forward_mode: "none",
+        libvirt__dhcp_enabled: false,
+        bridge_stp: false
+      machine.vm.network "private_network",
+        ip: node[:client_ip], mac: node[:client_mac], auto_config: false,
+        libvirt__network_name: "ha-client",
+        libvirt__host_ip: "10.20.3.1",
+        libvirt__forward_mode: "none",
+        libvirt__dhcp_enabled: false,
+        bridge_stp: false
+
+      machine.vm.provider :libvirt do |lv|
+        lv.driver = "kvm"
+        lv.memory = 4096
+        lv.cpus = 2
+        lv.graphics_type = "none"
+        lv.video_type = "vga"
+        lv.disk_bus = "virtio"
+        lv.nic_model_type = "virtio"
+      end
+
+      machine.vm.provision "lab-scripts", type: "file",
+        source: "scripts", destination: "/home/vagrant/ha-lab/scripts"
+      unless media.empty?
+        machine.vm.provision "lab-media", type: "file",
+          source: "software", destination: "/home/vagrant/ha-lab/software"
+      end
+      machine.vm.provision "lab-key", type: "file",
+        source: LAB_ROOT_KEY, destination: "/home/vagrant/ha-lab/lab_root_key"
+
+      env = lab_env(node, peer)
+
+      machine.vm.provision "base", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/01-base.sh", env: env
+      machine.vm.provision "storage", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/02-shared-storage.sh", env: env
+      machine.vm.provision "oracle_prereq", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/03-oracle-prereq.sh", env: env
+      machine.vm.provision "oracle_install", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/04-oracle-install.sh", env: env
+      machine.vm.provision "oracle_database", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/05-oracle-database.sh", env: env
+      # Cluster creation needs both nodes up, so it is not part of `vagrant up`.
+      # Run ./lab cluster once both machines are running.
+      machine.vm.provision "cluster", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/06-cluster.sh",
+        env: env, run: "never"
+      machine.vm.provision "status", type: "shell",
+        inline: "bash /home/vagrant/ha-lab/scripts/07-status.sh",
+        env: env, run: "never"
+    end
+  end
+end

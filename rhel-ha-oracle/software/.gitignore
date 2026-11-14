@@ -1,0 +1,4 @@
+# Installer media is not redistributable, so it never ends up in git.
+*
+!README.md
+!.gitignore
