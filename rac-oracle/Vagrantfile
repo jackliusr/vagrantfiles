@@ -1,0 +1,196 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Oracle Real Application Clusters (RAC) 19c lab: a two-node cluster with Grid
+# Infrastructure, ASM on iSCSI LUNs exported by an LIO target on the host, a
+# three-address SCAN served by dnsmasq, and a policy-managed RAC database.
+#
+# Prerequisites, media and usage are described in README.md.
+
+require "fileutils"
+
+LAB_DIR     = File.expand_path(__dir__)
+BOX         = ENV.fetch("RAC_LAB_BOX", "generic/oracle8")
+CLUSTER     = ENV.fetch("RAC_LAB_CLUSTER", "rac-lab")
+# Fully qualified: GI resolves SCAN through DNS, and a bare short name only works
+# when the resolver's search list happens to contain the lab domain.
+SCAN_NAME   = ENV.fetch("RAC_LAB_SCAN", "rac-scan.lab")
+DB_NAME     = ENV.fetch("RAC_LAB_DB", "ORCL")
+GRID_PASS   = ENV.fetch("RAC_LAB_GRID_PASSWORD", "Oracle123")
+DB_PASS     = ENV.fetch("RAC_LAB_DB_PASSWORD", "Oracle123")
+
+# ASM disks exported by host/lio-target.sh. Sizes are sparse files on the host.
+LUNS = [
+  { name: "ocr1", mb: 2048 },
+  { name: "ocr2", mb: 2048 },
+  { name: "ocr3", mb: 2048 },
+  { name: "data", mb: 12288 },
+  { name: "fra",  mb: 8192 },
+].freeze
+
+STORAGE_IP = ENV.fetch("RAC_LAB_STORAGE_IP", "10.40.3.1")
+STORAGE_IQN = ENV.fetch("RAC_LAB_ISCSI_IQN", "iqn.2026-11.lab.rac:asm")
+
+# Three isolated layer-2 segments plus the libvirt management network.
+NETWORKS = {
+  priv:    { name: "rac-priv",    host_ip: "10.40.1.1" },
+  pub:     { name: "rac-pub",     host_ip: "10.40.2.1" },
+  storage: { name: "rac-storage", host_ip: "10.40.3.1" },
+}.freeze
+
+# Adapter 1 is the libvirt management network (DHCP). The lab adapters are
+# static, configured by the provisioning scripts from these MAC addresses.
+NODES = [
+  {
+    name: "rac1", node_number: 1,
+    priv_ip: "10.40.1.11", pub_ip: "10.40.2.11",
+    storage_ip: "10.40.3.11",
+    vip: "10.40.2.101",
+    mac: { priv: "525400D00111", pub: "525400D00211", storage: "525400D00311" },
+  },
+  {
+    name: "rac2", node_number: 2,
+    priv_ip: "10.40.1.12", pub_ip: "10.40.2.12",
+    storage_ip: "10.40.3.12",
+    vip: "10.40.2.102",
+    mac: { priv: "525400D00112", pub: "525400D00212", storage: "525400D00312" },
+  },
+].freeze
+
+# SCAN addresses handed out by the dnsmasq instance on the host's public bridge.
+SCAN_IPS = %w[10.40.2.110 10.40.2.111 10.40.2.112].freeze
+
+LAB_ROOT_KEY = File.join(LAB_DIR, ".runtime", "lab_root_key")
+
+# Shared root key pair: Grid Infrastructure setup and root.sh need passwordless
+# root SSH between the two nodes, and the lab uses it for cross-node steps.
+unless File.exist?(LAB_ROOT_KEY)
+  FileUtils.mkdir_p(File.dirname(LAB_ROOT_KEY), mode: 0o700)
+  ok = system("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "rac-lab-root", "-f", LAB_ROOT_KEY)
+  raise "could not generate #{LAB_ROOT_KEY}" unless ok
+end
+
+def mac_with_colons(mac)
+  mac.scan(/../).join(":")
+end
+
+def lab_env(node, peer)
+  {
+    "LAB_NODE"             => node[:name],
+    "LAB_NODE_NUMBER"      => node[:node_number].to_s,
+    "LAB_PEER"             => peer[:name],
+    "LAB_CLUSTER_NAME"     => CLUSTER,
+    "LAB_SCAN_NAME"        => SCAN_NAME,
+    "LAB_DB_NAME"          => DB_NAME,
+    "LAB_GRID_PASSWORD"    => GRID_PASS,
+    "LAB_DB_PASSWORD"      => DB_PASS,
+    "LAB_PRIV_IP"          => node[:priv_ip],
+    "LAB_PUB_IP"           => node[:pub_ip],
+    "LAB_STORAGE_NODE_IP"  => node[:storage_ip],
+    "LAB_VIP"              => node[:vip],
+    "LAB_PEER_PRIV_IP"     => peer[:priv_ip],
+    "LAB_PEER_PUB_IP"      => peer[:pub_ip],
+    "LAB_PEER_VIP"         => peer[:vip],
+    "LAB_PRIV_NETWORK"     => "10.40.1.0",
+    "LAB_PUB_NETWORK"      => "10.40.2.0",
+    "LAB_STORAGE_NETWORK"  => "10.40.3.0",
+    "LAB_DNS_IP"           => "10.40.2.1",
+    "LAB_SCAN_IPS"         => SCAN_IPS.join(","),
+    "LAB_STORAGE_IP"       => STORAGE_IP,
+    "LAB_STORAGE_IQN"      => STORAGE_IQN,
+    "LAB_ASM_LUNS"         => LUNS.map { |l| l[:name] }.join(","),
+    "LAB_PRIV_MAC"         => mac_with_colons(node[:mac][:priv]),
+    "LAB_PUB_MAC"          => mac_with_colons(node[:mac][:pub]),
+    "LAB_STORAGE_MAC"      => mac_with_colons(node[:mac][:storage]),
+  }
+end
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.boot_timeout = 1200
+  # No 9p in the Oracle Linux kernel used by this box and no NFS dependency:
+  # everything is uploaded with file provisioners.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  media = Dir.glob(File.join(LAB_DIR, "software", "*")).sort.select do |path|
+    File.file?(path) && File.basename(path) !~ /\A(README\.md|\.gitignore)\z/
+  end
+
+  if media.empty?
+    warn "no Oracle media found in #{File.join(LAB_DIR, "software")}: the grid and " \
+         "database install steps will skip until it is added"
+  end
+
+  NODES.each do |node|
+    peer = NODES.find { |n| n[:name] != node[:name] }
+
+    config.vm.define node[:name] do |machine|
+      machine.vm.hostname = node[:name]
+
+      [
+        [:priv,    node[:priv_ip],     node[:mac][:priv]],
+        [:pub,     node[:pub_ip],      node[:mac][:pub]],
+        [:storage, node[:storage_ip],  node[:mac][:storage]],
+      ].each do |net_key, ip, mac|
+        net = NETWORKS.fetch(net_key)
+        machine.vm.network "private_network",
+          ip: ip, mac: mac, auto_config: false,
+          libvirt__network_name: net[:name],
+          libvirt__host_ip: net[:host_ip],
+          libvirt__forward_mode: "none",
+          libvirt__dhcp_enabled: false,
+          bridge_stp: false
+      end
+
+      machine.vm.provider :libvirt do |lv|
+        lv.driver = "kvm"
+        # Grid Infrastructure plus two instances: 8 GB is the comfortable floor.
+        lv.memory = 8192
+        lv.cpus = 4
+        lv.graphics_type = "none"
+        lv.video_type = "vga"
+        lv.disk_bus = "virtio"
+        lv.nic_model_type = "virtio"
+      end
+
+      machine.vm.provision "lab-scripts", type: "file",
+        source: "scripts", destination: "/home/vagrant/rac-lab/scripts"
+      # One provisioner per media file, named after the file: the media is often
+      # added after `vagrant up`, and then only that transfer has to be re-run
+      # (lab-media-LINUX.X64_193000_grid_home.zip) instead of everything.
+      # File.realpath resolves the symlinks people use to share one download
+      # between labs.
+      media.each do |path|
+        machine.vm.provision "lab-media-#{File.basename(path)}", type: "file",
+          source: File.realpath(path),
+          destination: "/home/vagrant/rac-lab/software/#{File.basename(path)}"
+      end
+      machine.vm.provision "lab-key", type: "file",
+        source: LAB_ROOT_KEY, destination: "/home/vagrant/rac-lab/lab_root_key"
+
+      env = lab_env(node, peer)
+
+      machine.vm.provision "base", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/01-base.sh", env: env
+      machine.vm.provision "storage", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/02-storage.sh", env: env
+      # Everything below needs both nodes up and the host iSCSI target, so it is
+      # applied by ./lab rather than during `vagrant up`.
+      machine.vm.provision "grid_install", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/03-grid-install.sh",
+        env: env, run: "never"
+      machine.vm.provision "asm", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/04-asm.sh",
+        env: env, run: "never"
+      machine.vm.provision "db_install", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/05-db-install.sh",
+        env: env, run: "never"
+      machine.vm.provision "db_create", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/06-db-create.sh",
+        env: env, run: "never"
+      machine.vm.provision "status", type: "shell",
+        inline: "bash /home/vagrant/rac-lab/scripts/07-status.sh",
+        env: env, run: "never"
+    end
+  end
+end

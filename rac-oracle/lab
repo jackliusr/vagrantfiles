@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Convenience wrapper around the vagrant/targetcli/grid commands of the RAC lab.
+set -Eeuo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+SCRIPTS=/home/vagrant/rac-lab/scripts
+SCAN_NAME=${RAC_LAB_SCAN:-rac-scan.lab}
+DB=${RAC_LAB_DB:-ORCL}
+PASSWORD=${RAC_LAB_DB_PASSWORD:-Oracle123}
+
+usage() {
+  cat <<'EOF'
+Usage: ./lab <command> [args]
+
+  up                 create and provision both nodes (rac1, rac2)
+  scan               publish the SCAN DNS records on the lab network (needs sudo)
+  status             cluster, ASM, storage and database state on both nodes
+  grid               install Grid Infrastructure + create OCR (needs the grid zip)
+  asm                create the DATA and FRA disk groups
+  db-software        install the RAC database software on both nodes
+  database           create the RAC database on +DATA/+FRA
+  install            grid + asm + db-software + database in one go
+  start | stop       start/stop the clusterware and database
+  start-grid|stop-grid   only the clusterware stack
+  sql [statement]    run a statement through SCAN (default: select from dual)
+  ssh [node]         open a shell (rac1 or rac2; default rac1)
+  provision NODE STEP  re-run one provisioning step (base, storage)
+  storage [cmd]      ./host/lio-target.sh setup|status|teardown
+  destroy            destroy both VMs, keeping the LUN images
+  clean              destroy the VMs and remove .storage/ and .runtime/
+EOF
+}
+
+guest_out() { vagrant ssh "$1" -c "$2" 2>/dev/null; }
+guest_sh()  { vagrant ssh "$1" -c "sudo bash $SCRIPTS/$2" 2> >(grep -v libvirt_ip_command >&2); }
+action()    { vagrant ssh "$1" -c "sudo bash $SCRIPTS/cluster-action.sh $2" 2> >(grep -v libvirt_ip_command >&2); }
+
+# Grid Infrastructure and everything after it is driven from node 1.
+grid_step() {
+  local script=$1 label=$2
+  echo "==> $label"
+  guest_sh rac1 "$script"
+}
+
+# The media is frequently downloaded after `vagrant up`, so the guests may not
+# have it. Uploading on demand means ./lab grid works either way.
+ensure_media() {
+  local node=$1 pattern=$2 file base
+  local found=false
+  for file in software/*.zip; do
+    [ -f "$file" ] || continue
+    base=$(basename "$file")
+    case $base in
+      $pattern) ;;
+      *) continue ;;
+    esac
+    found=true
+    if [ "$(guest_out "$node" "test -f /home/vagrant/rac-lab/software/$base && echo yes")" = "yes" ]; then
+      echo "    $base is already on $node"
+    else
+      echo "==> Uploading $base to $node ($(du -hL "$file" | cut -f1))"
+      vagrant provision "$node" --provision-with "lab-media-$base" 2>&1 |
+        grep -viE "libvirt_ip_command" | tail -2
+      if [ "$(guest_out "$node" "test -f /home/vagrant/rac-lab/software/$base && echo yes")" != "yes" ]; then
+        echo "ERROR: $base did not arrive on $node" >&2
+        exit 1
+      fi
+    fi
+  done
+  if [ "$found" != true ]; then
+    return 1
+  fi
+  return 0
+}
+
+case "${1:-help}" in
+  up)
+    # The LUNs have to exist before the storage step runs inside `vagrant up`,
+    # and the portal can only be narrowed to the storage bridge afterwards.
+    sudo ./host/lio-target.sh setup
+    vagrant up
+    sudo ./host/lio-target.sh setup
+    echo
+    echo "Both nodes are provisioned. Next: ./lab scan (sudo), then ./lab grid"
+    ;;
+  scan)
+    sudo ./host/scan-dns.sh setup
+    ;;
+  status)
+    if ./host/scan-dns.sh status >/dev/null 2>&1; then
+      echo "SCAN DNS: records published on the lab network"
+    else
+      echo "SCAN DNS: no records yet (sudo ./host/scan-dns.sh setup)"
+    fi
+    for node in rac1 rac2; do
+      guest_sh "$node" 07-status.sh
+      echo
+    done
+    ;;
+  grid)
+    ensure_media rac1 '*grid_home*.zip' ||
+      echo "    no grid media in software/ yet - the install step will explain what is missing"
+    grid_step 03-grid-install.sh "Installing Grid Infrastructure (20-40 min)"
+    ;;
+  asm)
+    grid_step 04-asm.sh "Creating the DATA and FRA disk groups"
+    ;;
+  db-software)
+    ensure_media rac1 '*db_home*.zip' ||
+      echo "    no database media in software/ yet"
+    grid_step 05-db-install.sh "Installing the RAC database software (20-30 min)"
+    ;;
+  database)
+    grid_step 06-db-create.sh "Creating the RAC database"
+    ;;
+  install)
+    "${BASH_SOURCE[0]}" grid
+    "${BASH_SOURCE[0]}" asm
+    "${BASH_SOURCE[0]}" db-software
+    "${BASH_SOURCE[0]}" database
+    ;;
+  start)
+    action rac1 start-db
+    ;;
+  stop)
+    action rac1 stop-db
+    ;;
+  start-grid)
+    action rac1 start-grid
+    ;;
+  stop-grid)
+    action rac1 stop-grid
+    ;;
+  sql)
+    statement=${2:-"select instance_name, host_name, status from v\$instance;"}
+    {
+      echo "whenever sqlerror exit failure"
+      printf '%s\n' "$statement" | sed 's/;[[:space:]]*/;\n/g'
+      echo "exit"
+    } | vagrant ssh rac1 \
+      -c "sudo su - oracle -c 'sqlplus -s -L system/$PASSWORD@//$SCAN_NAME/$DB'" 2>/dev/null
+    ;;
+  ssh)
+    vagrant ssh "${2:-rac1}"
+    ;;
+  provision)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    vagrant provision "$2" --provision-with "$3"
+    ;;
+  storage)
+    shift
+    if [ $# -eq 0 ]; then sudo ./host/lio-target.sh status; else sudo ./host/lio-target.sh "$@"; fi
+    ;;
+  destroy)
+    vagrant destroy -f
+    ;;
+  clean)
+    vagrant destroy -f
+    sudo ./host/scan-dns.sh teardown || true
+    sudo ./host/lio-target.sh teardown --purge || true
+    rm -rf .runtime
+    echo "cluster, LUN images and the SCAN service removed"
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

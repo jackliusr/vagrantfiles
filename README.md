@@ -9,6 +9,7 @@ the larger labs wrap the common commands in a `./lab` helper.
 
 | Directory | What it builds | Provider / box | Provisioning |
 |-----------|----------------|----------------|--------------|
+| [rac-oracle](rac-oracle/) | Oracle 19c Real Application Clusters lab: two nodes, Grid Infrastructure, three-address SCAN and ASM on five iSCSI LUNs exported by a host LIO target | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`07` via `./lab` |
 | [dr-oracle](dr-oracle/) | Oracle 19c disaster-recovery lab: two data centres, each with its own iSCSI SAN array emulated by `targetcli`, block-replicated between the sites with DRBD (SRDF/SnapMirror/ActiveDR style) | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`10` via `./lab` |
 | [rhel-ha-oracle](rhel-ha-oracle/) | Two-node Red Hat HA cluster (Pacemaker + Corosync + `pcs`) with SBD fencing and an Oracle 19c single instance on shared iSCSI storage | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`07` via `./lab` |
 | [vcs-oracle](vcs-oracle/) | Two-node Veritas InfoScale (VCS) cluster with VXFEN I/O fencing and an Oracle 19c single instance on PR-capable iSCSI LUNs | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`08` via `./lab` |
@@ -111,6 +112,30 @@ ln -s ../../rhel-ha-oracle/software/LINUX.X64_193000_db_home.zip software/
 `./lab sql "select * from dr_test;"` queries the active site through the floating
 address `10.50.40.100:1521`, and `./lab mode async` / `./lab wan 20ms` show what
 asynchronous replication and a slow WAN do to the data-loss window.
+
+## RAC lab (libvirt)
+
+### rac-oracle
+
+A two-node RAC cluster: Grid Infrastructure 19c (Clusterware + ASM), node VIPs,
+a three-address SCAN served by DNS, and a policy-managed database on `+DATA`.
+The five shared LUNs (three for OCR/voting, one DATA, one FRA) come from an LIO
+iSCSI target on the host, and each one is presented as `/dev/asm-diskN` through
+udev rules that match the LUN's own name.
+
+```bash
+cd rac-oracle
+./lab up        # host LUNs + two prepared nodes (rac1, rac2)
+./lab scan      # publish rac-scan.lab (3 A records) on the lab network (sudo)
+./lab status    # storage, ASM devices, DNS, cluster state
+./lab grid      # needs LINUX.X64_193000_grid_home.zip in software/
+./lab install   # grid + asm + db-software + database
+./lab sql "select instance_name, host_name from v\$instance;"
+```
+
+RAC needs **two** Oracle homes (Grid Infrastructure and Database), so the grid
+zip is the one hard prerequisite. Without it the lab still produces two fully
+prepared nodes and `./lab grid` says exactly what is missing.
 
 ## Other environments
 
