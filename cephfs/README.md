@@ -199,6 +199,44 @@ Both clients mount the same file system, so a file written on one is visible on
 the other with the same inode — `./lab demo` shows that, and it is the whole
 point of a clustered file system.
 
+### Writing a file on one client and reading it on the other
+
+There is no copy step: both clients mount the same file system, so the file
+created on `client1` *is* the file `client2` reads — same inode, same data, no
+`scp`, no `rsync`, no `sync`.
+
+```bash
+./lab ssh client1
+echo hello > /mnt/cephfs/shared/hello.txt
+exit
+./lab ssh client2
+cat /mnt/cephfs/shared/hello.txt
+stat -c 'inode=%i %n' /mnt/cephfs/shared/hello.txt
+```
+
+```
+hello
+inode=1099511628294 /mnt/cephfs/shared/hello.txt
+```
+
+`03-client.sh` creates `/mnt/cephfs/shared` mode 1777 for exactly this: the file
+system root belongs to `root` (`ceph-fuse` runs as root and mounts with
+`allow_other`, but a normal user cannot create files in a `root`-owned 0755
+directory), so this is the one place the `vagrant` user can write without
+`sudo`.
+
+The same thing without a shell, which is what `./lab demo` automates:
+
+```bash
+vagrant ssh client1 -c 'echo hello > /mnt/cephfs/shared/hello.txt'
+vagrant ssh client2 -c 'cat /mnt/cephfs/shared/hello.txt'
+```
+
+Both mounts take their view from the MDS, which owns the namespace: `ls`,
+`stat`, `cat` and `open` on the second client see the write as soon as the first
+client has closed the file. A descriptor that was already open keeps its own
+offset and does not pick the change up mid-stream — reopen it.
+
 ### Why the client mounts with ceph-fuse
 
 Ceph Squid issues cephx keys with the `aes256k` cipher by default — Squid's

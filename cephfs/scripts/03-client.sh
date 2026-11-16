@@ -64,6 +64,14 @@ systemctl enable remote-fs.target >/dev/null 2>&1 || warn "could not enable remo
 systemctl daemon-reload
 info "$LAB_MOUNT is mounted at boot through remote-fs.target"
 
+log "Creating the shared scratch directory"
+# The file system root is owned by root (ceph-fuse runs as root and mounts with
+# allow_other), so the vagrant user can read but not create files there. A
+# world-writable, sticky directory gives both clients somewhere to write
+# without sudo: it is the same directory in both mounts.
+install -d -m 1777 "$LAB_MOUNT/shared"
+info "$LAB_MOUNT/shared is mode $(stat -c %a "$LAB_MOUNT/shared")"
+
 log "Verifying the mount"
 stat -f -c '    filesystem type %T, %S byte blocks, mounted from %n' "$LAB_MOUNT"
 df -h "$LAB_MOUNT" | sed 's/^/    /'
