@@ -1,0 +1,156 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Ceph File System lab: a three-node Ceph cluster (three monitors, two managers,
+# six OSDs on two local disks each and an active/standby MDS pair) plus a fourth
+# VM that mounts the CephFS volume through the kernel client.
+#
+# Prerequisites and usage are described in README.md.
+
+require "fileutils"
+
+LAB_DIR  = File.expand_path(__dir__)
+BOX      = ENV.fetch("CEPH_LAB_BOX", "generic/oracle9")
+CLUSTER  = ENV.fetch("CEPH_LAB_CLUSTER", "ceph-lab")
+FS_NAME  = ENV.fetch("CEPH_LAB_FS", "cephfs")
+RELEASE  = ENV.fetch("CEPH_LAB_RELEASE", "squid")
+# The upstream download server is slow from some networks; any mirror of
+# download.ceph.com works, e.g. https://mirrors.tuna.tsinghua.edu.cn/ceph
+MIRROR   = ENV.fetch("CEPH_LAB_MIRROR", "https://download.ceph.com")
+# Empty means "whatever image matches the cephadm version", which is the sane
+# default: cephadm refuses to manage daemons from a mismatched release.
+IMAGE    = ENV.fetch("CEPH_LAB_IMAGE", "")
+DASH_PASS = ENV.fetch("CEPH_LAB_DASHBOARD_PASSWORD", "Ceph12345")
+MEMORY   = Integer(ENV.fetch("CEPH_LAB_MEMORY", "4096"))
+CPUS     = Integer(ENV.fetch("CEPH_LAB_CPUS", "2"))
+OSD_DISKS = Integer(ENV.fetch("CEPH_LAB_OSD_DISKS", "2"))
+OSD_DISK_SIZE = ENV.fetch("CEPH_LAB_OSD_DISK_SIZE", "8G")
+
+# One isolated layer-2 segment for the daemons and the client. Adapter 1 stays
+# on the libvirt management network, which is what gives the VMs internet access
+# for the Ceph package repository and the container image.
+NETWORK = { name: "ceph-pub", host_ip: "10.60.1.1" }.freeze
+PUBLIC_NETWORK = "10.60.1.0"
+
+SERVERS = [
+  { name: "ceph1", ip: "10.60.1.11", mac: "525400C00111" },
+  { name: "ceph2", ip: "10.60.1.12", mac: "525400C00112" },
+  { name: "ceph3", ip: "10.60.1.13", mac: "525400C00113" },
+].freeze
+CLIENT = { name: "client", ip: "10.60.1.21", mac: "525400C00121" }.freeze
+
+STAGING = "/home/vagrant/ceph-lab"
+LAB_ROOT_KEY = File.join(LAB_DIR, ".runtime", "lab_root_key")
+
+# Root SSH between the lab nodes: 02-cluster.sh hands the cephadm key around and
+# the client pulls its config from ceph1, so one shared key pair keeps that
+# bootstrap simple.
+unless File.exist?(LAB_ROOT_KEY)
+  FileUtils.mkdir_p(File.dirname(LAB_ROOT_KEY), mode: 0o700)
+  ok = system("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ceph-lab-root",
+              "-f", LAB_ROOT_KEY)
+  raise "could not generate #{LAB_ROOT_KEY}" unless ok
+end
+
+def mac_with_colons(mac)
+  mac.scan(/../).join(":")
+end
+
+def lab_env(node, node_number)
+  {
+    "LAB_NODE"               => node[:name],
+    "LAB_ROLE"               => node[:role],
+    "LAB_NODE_NUMBER"        => node_number.to_s,
+    "LAB_IP"                 => node[:ip],
+    "LAB_NIC_MAC"            => mac_with_colons(node[:mac]),
+    "LAB_CLUSTER_NAME"       => CLUSTER,
+    "LAB_FS_NAME"            => FS_NAME,
+    "LAB_CLIENT_USER"        => FS_NAME,
+    "LAB_PUBLIC_NETWORK"     => PUBLIC_NETWORK,
+    "LAB_SERVERS"            => SERVERS.map { |n| "#{n[:name]}:#{n[:ip]}" }.join(","),
+    "LAB_CLIENT_NAME"        => CLIENT[:name],
+    "LAB_CLIENT_IP"          => CLIENT[:ip],
+    "LAB_BOOTSTRAP_HOST"     => SERVERS.first[:name],
+    "LAB_BOOTSTRAP_IP"       => SERVERS.first[:ip],
+    "LAB_CEPH_RELEASE"       => RELEASE,
+    "LAB_CEPH_MIRROR"        => MIRROR,
+    "LAB_IMAGE"              => IMAGE,
+    "LAB_DASHBOARD_PASSWORD" => DASH_PASS,
+    "LAB_OSD_DISKS"          => OSD_DISKS.to_s,
+    "LAB_STAGING"            => STAGING,
+  }
+end
+
+NODES = SERVERS.map { |n| n.merge(role: "server") } + [CLIENT.merge(role: "client")]
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.boot_timeout = 1200
+  # No 9p in the Oracle Linux kernel used by this box and no NFS dependency:
+  # everything is uploaded with file provisioners.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  NODES.each_with_index do |node, index|
+    config.vm.define node[:name] do |machine|
+      machine.vm.hostname = node[:name]
+
+      machine.vm.network "private_network",
+        ip: node[:ip], mac: node[:mac], auto_config: false,
+        libvirt__network_name: NETWORK[:name],
+        libvirt__host_ip: NETWORK[:host_ip],
+        libvirt__forward_mode: "none",
+        libvirt__dhcp_enabled: false,
+        bridge_stp: false
+
+      machine.vm.provider :libvirt do |lv|
+        lv.driver = "kvm"
+        # A monitor, a manager, a standby MDS and two OSDs fit comfortably in
+        # 4 GB; the client only mounts the file system.
+        if node[:role] == "server"
+          lv.memory = MEMORY
+          lv.cpus = CPUS
+        else
+          # 1 GB is enough for the mount, but not for dnf: the Oracle Linux
+          # metadata set alone is ~300 MB and dnf gets OOM-killed.
+          lv.memory = 2048
+          lv.cpus = 1
+        end
+        lv.graphics_type = "none"
+        lv.video_type = "vga"
+        lv.disk_bus = "virtio"
+        lv.nic_model_type = "virtio"
+
+        # The OSD disks are the lab's only storage: Ceph replicates between the
+        # hosts, so nothing is shared and nothing is carved up here. cephadm
+        # picks up whole, unused devices by itself.
+        if node[:role] == "server"
+          OSD_DISKS.times do
+            lv.storage :file, size: OSD_DISK_SIZE, type: "qcow2", bus: "virtio"
+          end
+        end
+      end
+
+      machine.vm.provision "lab-scripts", type: "file",
+        source: "scripts", destination: "#{STAGING}/scripts"
+      machine.vm.provision "lab-key", type: "file",
+        source: LAB_ROOT_KEY, destination: "#{STAGING}/lab_root_key"
+
+      env = lab_env(node, index + 1)
+
+      machine.vm.provision "base", type: "shell",
+        inline: "bash #{STAGING}/scripts/01-base.sh", env: env
+      # The cluster step only makes sense once all three servers are up, and the
+      # client can only join a cluster that exists, so both are applied by ./lab.
+      if node[:name] == SERVERS.first[:name]
+        machine.vm.provision "cluster", type: "shell",
+          inline: "bash #{STAGING}/scripts/02-cluster.sh", env: env, run: "never"
+      end
+      if node[:role] == "client"
+        machine.vm.provision "client", type: "shell",
+          inline: "bash #{STAGING}/scripts/03-client.sh", env: env, run: "never"
+      end
+      machine.vm.provision "status", type: "shell",
+        inline: "bash #{STAGING}/scripts/04-status.sh", env: env, run: "never"
+    end
+  end
+end

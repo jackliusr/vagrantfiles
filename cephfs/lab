@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Convenience wrapper around the vagrant/ceph commands of the Ceph File System
+# lab.
+set -Eeuo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+SCRIPTS=/home/vagrant/ceph-lab/scripts
+FS=${CEPH_LAB_FS:-cephfs}
+MOUNT=${CEPH_LAB_MOUNT:-/mnt/cephfs}
+SERVERS="ceph1 ceph2 ceph3"
+CLIENT=client
+
+usage() {
+  cat <<'EOF'
+Usage: ./lab <command> [args]
+
+  up                   create and provision the four VMs (ceph1-3, client)
+  cluster              bootstrap the cluster, OSDs, MDS pair and the file system
+  client               join the client VM and mount the file system
+  install              cluster + client in one go
+  status               cluster, daemon and mount state on every node
+  ceph [args]          run a ceph command on ceph1 (default: -s)
+  shell [cmd]          a cephadm shell on ceph1, where the ceph CLI lives
+  ssh [node]           open a shell on a node (default ceph1)
+  df                   cluster capacity and the client's mount
+  fs [mount|umount]    mount or unmount the file system on the client
+  bench                RADOS and CephFS throughput checks (~1 minute)
+  demo                 snapshots, quotas, subvolumes and self-healing
+  crash [node]         power off a node without stopping Ceph (default ceph2)
+  recover [node]       start that node again and wait for the cluster to heal
+  start|stop|restart [node]   the Ceph daemons on one node (default ceph1)
+  logs [node]          the last 100 journal lines of the Ceph daemons
+  provision NODE STEP  re-run one provisioning step (base, cluster, client)
+  halt                 stop the VMs, keeping the disks and the cluster
+  destroy              destroy the VMs (the cluster is gone with them)
+  clean                destroy the VMs and remove .runtime/
+EOF
+}
+
+guest_sh()  { vagrant ssh "$1" -c "sudo bash $SCRIPTS/$2" 2> >(grep -v libvirt_ip_command >&2); }
+
+# Run a snippet as root on a node with the snippet on stdin, which keeps the
+# quoting of the demo commands readable.
+on() { vagrant ssh "$1" -c "sudo bash -s" 2>/dev/null; }
+
+ceph_json() { vagrant ssh ceph1 -c "sudo ceph $1 --format json" 2>/dev/null; }
+
+pgs_clean() {
+  ceph_json "pg stat" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+pg = d.get("pg_summary") or d.get("pgmap") or d
+num = pg.get("num_pgs", pg.get("num_pg"))
+states = pg.get("num_pg_by_state") or pg.get("pgs_by_state") or []
+clean = sum(s.get("num", s.get("count", 0)) for s in states
+            if (s.get("name") or s.get("state_name")) == "active+clean")
+sys.exit(0 if num is not None and clean == num else 1)'
+}
+
+# health_ok - true while the cluster reports HEALTH_OK.
+health_ok() {
+  vagrant ssh ceph1 -c "sudo ceph health" 2>/dev/null | grep -qx 'HEALTH_OK'
+}
+
+# wait_clean [seconds] - poll until every placement group is active+clean.
+wait_clean() {
+  local timeout=${1:-600}
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if pgs_clean; then
+      echo "    all placement groups are active+clean"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "    still not active+clean after ${timeout}s:"
+  vagrant ssh ceph1 -c "sudo ceph pg stat" 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+need_mount() {
+  if ! vagrant ssh "$CLIENT" -c "mountpoint -q $MOUNT" >/dev/null 2>&1; then
+    echo "ERROR: $MOUNT is not mounted on $CLIENT - run ./lab client first" >&2
+    exit 1
+  fi
+}
+
+# vagrant-libvirt names the domain <directory>_<machine>.
+domain_for() {
+  sudo virsh list --all --name 2>/dev/null | grep -E "_${1}\$" | head -n1
+}
+
+demo_snapshots() {
+  echo "== snapshots: CephFS keeps a read-only view of a directory"
+  on "$CLIENT" <<EOS
+set -e
+install -d "$MOUNT/demo/snap"
+printf 'first version\n'  > "$MOUNT/demo/snap/report.txt"
+mkdir "$MOUNT/demo/snap/.snap/before-edit"
+printf 'second version\n' > "$MOUNT/demo/snap/report.txt"
+echo "    current   \$(cat "$MOUNT/demo/snap/report.txt")"
+echo "    snapshot  \$(cat "$MOUNT/demo/snap/.snap/before-edit/report.txt")"
+rm -f "$MOUNT/demo/snap/report.txt"
+cp "$MOUNT/demo/snap/.snap/before-edit/report.txt" "$MOUNT/demo/snap/report.txt"
+echo "    restored  \$(cat "$MOUNT/demo/snap/report.txt")"
+rmdir "$MOUNT/demo/snap/.snap/before-edit"
+EOS
+}
+
+demo_quota() {
+  echo "== quotas: a directory can cap its own size"
+  on "$CLIENT" <<EOS
+set -e
+install -d "$MOUNT/demo/quota"
+setfattr -n ceph.quota.max_bytes -v 10485760 "$MOUNT/demo/quota"
+echo "    limit: \$(getfattr --only-values -n ceph.quota.max_bytes "$MOUNT/demo/quota") bytes"
+if dd if=/dev/zero of="$MOUNT/demo/quota/too-big" bs=1M count=20 status=none 2>/dev/null; then
+  echo "    a 20 MiB write was allowed, which should not happen"
+else
+  echo "    a 20 MiB write was refused: \$(du -sh "$MOUNT/demo/quota" | cut -f1) landed, the rest hit EDQUOT"
+fi
+rm -rf "$MOUNT/demo/quota"
+EOS
+}
+
+demo_subvolume() {
+  echo "== subvolumes: independent trees with their own quota"
+  local path
+  path=$(vagrant ssh ceph1 -c "sudo bash -s" 2>/dev/null <<EOS | tr -d '\r'
+ceph fs subvolumegroup create $FS apps >/dev/null 2>&1 || true
+ceph fs subvolume create $FS web --group_name apps --size 2147483648 >/dev/null 2>&1 || true
+ceph fs subvolume getpath $FS web --group_name apps
+EOS
+)
+  echo "    path in the file system: $path"
+  on "$CLIENT" <<EOS
+set -e
+ls -ld "$MOUNT$path" | sed 's/^/    /'
+echo "    quota: \$(getfattr --only-values -n ceph.quota.max_bytes "$MOUNT$path") bytes"
+EOS
+}
+
+demo_selfheal() {
+  echo "== self-healing: taking one OSD out and putting it back"
+  local osd
+  osd=$(vagrant ssh ceph1 -c "sudo ceph osd ls" 2>/dev/null | head -n1)
+  echo "    osd.$osd goes out of the CRUSH map"
+  vagrant ssh ceph1 -c "sudo ceph osd out $osd" >/dev/null 2>&1
+  sleep 10
+  vagrant ssh ceph1 -c "sudo ceph -s" 2>/dev/null | sed -n '4,17p' | sed 's/^/    /'
+  echo "    waiting for the cluster to backfill..."
+  wait_clean 600 || true
+  echo "    osd.$osd comes back"
+  vagrant ssh ceph1 -c "sudo ceph osd in $osd" >/dev/null 2>&1
+  wait_clean 600 || true
+}
+
+case "${1:-help}" in
+  up)
+    vagrant up --parallel
+    echo
+    if vagrant ssh ceph1 -c "sudo test -f /etc/ceph/ceph.conf" >/dev/null 2>&1; then
+      echo "The cluster is up. ./lab status shows where it stands; ./lab client"
+      echo "remounts the file system if the client was rebuilt."
+    else
+      echo "All four nodes are prepared. Next: ./lab cluster, then ./lab client"
+    fi
+    ;;
+  cluster)
+    guest_sh ceph1 02-cluster.sh
+    ;;
+  client)
+    guest_sh "$CLIENT" 03-client.sh
+    ;;
+  install)
+    "${BASH_SOURCE[0]}" cluster
+    "${BASH_SOURCE[0]}" client
+    ;;
+  status)
+    for node in $SERVERS $CLIENT; do
+      guest_sh "$node" 04-status.sh
+      echo
+    done
+    ;;
+  ceph)
+    shift
+    [ $# -gt 0 ] || set -- -s
+    vagrant ssh ceph1 -c "sudo ceph $(printf '%q ' "$@")" 2> >(grep -v libvirt_ip_command >&2)
+    ;;
+  shell)
+    shift
+    # cephadm shell already separates the command with --, so ./lab shell -- ceph -s
+    # and ./lab shell ceph -s both work.
+    [ "${1:-}" = "--" ] && shift
+    if [ $# -gt 0 ]; then
+      vagrant ssh ceph1 -c "sudo cephadm shell -- $(printf '%q ' "$@")"
+    else
+      vagrant ssh ceph1 -c "sudo cephadm shell"
+    fi
+    ;;
+  ssh)
+    vagrant ssh "${2:-ceph1}"
+    ;;
+  df)
+    vagrant ssh ceph1 -c "sudo ceph df" 2>/dev/null
+    echo
+    if vagrant ssh "$CLIENT" -c "mountpoint -q $MOUNT" >/dev/null 2>&1; then
+      vagrant ssh "$CLIENT" -c "df -h $MOUNT" 2>/dev/null
+    else
+      echo "$MOUNT is not mounted on $CLIENT (./lab client)"
+    fi
+    ;;
+  fs)
+    case "${2:-mount}" in
+      mount)  vagrant ssh "$CLIENT" -c "sudo bash $SCRIPTS/cluster-action.sh mount" 2>/dev/null ;;
+      umount) vagrant ssh "$CLIENT" -c "sudo bash $SCRIPTS/cluster-action.sh umount" 2>/dev/null ;;
+      *) usage; exit 2 ;;
+    esac
+    ;;
+  bench)
+    echo "== RADOS: 4 MB objects in a dedicated pool"
+    on ceph1 <<'EOS'
+set -e
+ceph osd pool create bench >/dev/null 2>&1 || true
+ceph osd pool application enable bench bench >/dev/null 2>&1 || true
+cephadm shell -- rados bench -p bench 10 write --no-cleanup -b 4M 2>/dev/null </dev/null |
+  grep 'Bandwidth (MB/sec)' | sed 's/^/    write /'
+cephadm shell -- rados bench -p bench 10 seq 2>/dev/null </dev/null |
+  grep 'Bandwidth (MB/sec)' | sed 's/^/    read  /'
+cephadm shell -- rados cleanup -p bench >/dev/null 2>&1 </dev/null || true
+EOS
+    echo
+    echo "== CephFS: 512 MB written and read back through the mount"
+    need_mount
+    on "$CLIENT" <<EOS
+set -e
+mkdir -p "$MOUNT/demo"
+dd if=/dev/zero of="$MOUNT/demo/dd.img" bs=4M count=128 conv=fdatasync 2>&1 | tail -1 | sed 's/^/    write: /'
+echo 3 > /proc/sys/vm/drop_caches
+dd if="$MOUNT/demo/dd.img" of=/dev/null bs=4M count=128 2>&1 | tail -1 | sed 's/^/    read:  /'
+rm -f "$MOUNT/demo/dd.img"
+EOS
+    ;;
+  demo)
+    need_mount
+    demo_snapshots
+    echo
+    demo_quota
+    echo
+    demo_subvolume
+    echo
+    demo_selfheal
+    ;;
+  crash)
+    node=${2:-ceph2}
+    domain=$(domain_for "$node")
+    [ -n "$domain" ] || { echo "ERROR: no libvirt domain for $node" >&2; exit 1; }
+    echo "== powering off $node without shutting its daemons down"
+    sudo virsh destroy "$domain"
+    sleep 15
+    echo
+    echo "The cluster keeps serving: two of three monitors are still a quorum and"
+    echo "every placement group is still writable (size 3, min_size 2)."
+    vagrant ssh ceph1 -c "sudo ceph -s" 2>/dev/null | sed -n '2,14p' | sed 's/^/    /'
+    echo
+    echo "Bring it back with: ./lab recover $node"
+    ;;
+  recover)
+    node=${2:-ceph2}
+    echo "== starting $node again"
+    vagrant up --no-provision "$node"
+    echo
+    echo "Waiting for the daemons, the device probe and the backfill..."
+    wait_clean 900 || echo "    (a lab that keeps writing will take longer)"
+    # cephadm scans the devices of a host that just came back, and the OSDs may
+    # replay a little, so the warnings clear a few seconds after the PGs do.
+    for _ in $(seq 1 60); do
+      health_ok && break
+      sleep 5
+    done
+    vagrant ssh ceph1 -c "sudo ceph -s" 2>/dev/null | sed -n '2,17p' | sed 's/^/    /'
+    ;;
+  start | stop | restart)
+    vagrant ssh "${2:-ceph1}" -c "sudo bash $SCRIPTS/cluster-action.sh $1" 2> >(grep -v libvirt_ip_command >&2)
+    ;;
+  logs)
+    vagrant ssh "${2:-ceph1}" -c "sudo journalctl -u 'ceph-*' -n 100 --no-pager" 2>/dev/null
+    ;;
+  provision)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    vagrant provision "$2" --provision-with "$3"
+    ;;
+  halt)
+    vagrant halt
+    ;;
+  destroy)
+    vagrant destroy -f
+    ;;
+  clean)
+    vagrant destroy -f
+    rm -rf .runtime
+    echo "cluster and lab key removed"
+    ;;
+  help | -h | --help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
