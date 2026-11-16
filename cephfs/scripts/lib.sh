@@ -97,19 +97,23 @@ wait_until() {
   return 1
 }
 
-# The lab nodes as "name:ip" pairs, in cluster order.
+# The cluster nodes as "name:ip" pairs, in cluster order.
 # shellcheck disable=SC2086  # the comma separated list is meant to split.
 lab_nodes() { printf '%s\n' ${LAB_SERVERS//,/ }; }
+
+# The client nodes, same "name:ip" form.
+# shellcheck disable=SC2086
+client_nodes() { printf '%s\n' ${LAB_CLIENTS//,/ }; }
 
 # Every node of the lab, servers first.
 lab_all_nodes() {
   lab_nodes | sed 's/:.*//'
-  printf '%s\n' "$LAB_CLIENT_NAME"
+  client_nodes | sed 's/:.*//'
 }
 
 node_ip() {
   local spec
-  for spec in $(lab_nodes) "$LAB_CLIENT_NAME:$LAB_CLIENT_IP"; do
+  for spec in $(lab_nodes) $(client_nodes); do
     if [ "${spec%%:*}" = "$1" ]; then
       printf '%s' "${spec#*:}"
       return 0
@@ -119,6 +123,10 @@ node_ip() {
 }
 
 server_names() { lab_nodes | sed 's/:.*//'; }
+client_names() { client_nodes | sed 's/:.*//'; }
+
+# The CephX user of a client node: client.client1, client.client2, ...
+client_entity() { printf 'client.%s' "${1:-$LAB_NODE}"; }
 
 # Comma separated monitor list, the form mount.ceph and the ceph CLI expect.
 mon_list() { server_names | paste -sd, -; }
@@ -166,8 +174,8 @@ mount_cephfs() {
   fi
   install -d -m 0755 "$mnt"
   # ceph-fuse (libcephfs) rather than mount.ceph: the monitors issue aes256k
-  # cephx keys, which only kernels 6.12 and later understand. See README.md.
-  ceph-fuse -n "client.$LAB_CLIENT_USER" -c "$CEPH_CONF_DIR/ceph.conf" "$mnt" \
+  # cephx keys, which the kernel's net/ceph does not implement. See README.md.
+  ceph-fuse -n "$(client_entity)" -c "$CEPH_CONF_DIR/ceph.conf" "$mnt" \
     || die "could not mount $LAB_FS_NAME on $mnt"
   sleep 1
   mountpoint -q "$mnt" || die "ceph-fuse exited without mounting $mnt"

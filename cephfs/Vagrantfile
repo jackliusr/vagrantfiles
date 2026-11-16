@@ -25,8 +25,9 @@ MEMORY   = Integer(ENV.fetch("CEPH_LAB_MEMORY", "4096"))
 CPUS     = Integer(ENV.fetch("CEPH_LAB_CPUS", "2"))
 OSD_DISKS = Integer(ENV.fetch("CEPH_LAB_OSD_DISKS", "2"))
 OSD_DISK_SIZE = ENV.fetch("CEPH_LAB_OSD_DISK_SIZE", "8G")
+CLIENT_COUNT = Integer(ENV.fetch("CEPH_LAB_CLIENTS", "2"))
 
-# One isolated layer-2 segment for the daemons and the client. Adapter 1 stays
+# One isolated layer-2 segment for the daemons and the clients. Adapter 1 stays
 # on the libvirt management network, which is what gives the VMs internet access
 # for the Ceph package repository and the container image.
 NETWORK = { name: "ceph-pub", host_ip: "10.60.1.1" }.freeze
@@ -37,7 +38,16 @@ SERVERS = [
   { name: "ceph2", ip: "10.60.1.12", mac: "525400C00112" },
   { name: "ceph3", ip: "10.60.1.13", mac: "525400C00113" },
 ].freeze
-CLIENT = { name: "client", ip: "10.60.1.21", mac: "525400C00121" }.freeze
+# client1, client2, ... at 10.60.1.21, .22, ... Each one gets its own CephX
+# user (client.client1, client.client2, ...) so the two mounts are independent
+# clients as far as the cluster is concerned.
+CLIENTS = (1..CLIENT_COUNT).map do |n|
+  {
+    name: "client#{n}",
+    ip: format("10.60.1.%d", 20 + n),
+    mac: format("525400C0%04X", 0x0120 + n),
+  }
+end.freeze
 
 STAGING = "/home/vagrant/ceph-lab"
 LAB_ROOT_KEY = File.join(LAB_DIR, ".runtime", "lab_root_key")
@@ -65,11 +75,9 @@ def lab_env(node, node_number)
     "LAB_NIC_MAC"            => mac_with_colons(node[:mac]),
     "LAB_CLUSTER_NAME"       => CLUSTER,
     "LAB_FS_NAME"            => FS_NAME,
-    "LAB_CLIENT_USER"        => FS_NAME,
     "LAB_PUBLIC_NETWORK"     => PUBLIC_NETWORK,
     "LAB_SERVERS"            => SERVERS.map { |n| "#{n[:name]}:#{n[:ip]}" }.join(","),
-    "LAB_CLIENT_NAME"        => CLIENT[:name],
-    "LAB_CLIENT_IP"          => CLIENT[:ip],
+    "LAB_CLIENTS"            => CLIENTS.map { |c| "#{c[:name]}:#{c[:ip]}" }.join(","),
     "LAB_BOOTSTRAP_HOST"     => SERVERS.first[:name],
     "LAB_BOOTSTRAP_IP"       => SERVERS.first[:ip],
     "LAB_CEPH_RELEASE"       => RELEASE,
@@ -81,7 +89,8 @@ def lab_env(node, node_number)
   }
 end
 
-NODES = SERVERS.map { |n| n.merge(role: "server") } + [CLIENT.merge(role: "client")]
+NODES = SERVERS.map { |n| n.merge(role: "server") } +
+        CLIENTS.map { |c| c.merge(role: "client") }
 
 Vagrant.configure("2") do |config|
   config.vm.box = BOX

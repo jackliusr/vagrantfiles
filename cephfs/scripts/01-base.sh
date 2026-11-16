@@ -22,8 +22,7 @@ load_lab_env
 : "${LAB_NIC_MAC:?LAB_NIC_MAC is not set}"
 : "${LAB_PUBLIC_NETWORK:?LAB_PUBLIC_NETWORK is not set}"
 : "${LAB_SERVERS:?LAB_SERVERS is not set}"
-: "${LAB_CLIENT_NAME:?LAB_CLIENT_NAME is not set}"
-: "${LAB_CLIENT_IP:?LAB_CLIENT_IP is not set}"
+: "${LAB_CLIENTS:?LAB_CLIENTS is not set}"
 : "${LAB_CEPH_RELEASE:?LAB_CEPH_RELEASE is not set}"
 
 log "Preparing Ceph node $LAB_NODE ($LAB_ROLE)"

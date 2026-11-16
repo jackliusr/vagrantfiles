@@ -1,23 +1,28 @@
-# Ceph File System lab: three servers, six OSDs, one shared file system
+# Ceph File System lab: three servers, six OSDs, two clients, one file system
 
 A three-node Ceph cluster on libvirt that serves a **Ceph File System** (CephFS)
-volume to a fourth VM through the FUSE client. It is built like the other cluster
-labs in this repository: Oracle Linux guests on libvirt, everything declared in
-the `Vagrantfile`, and a `./lab` helper that sequences the steps that need more
-than one node.
+volume to two client VMs through the FUSE client. It is built like the other
+cluster labs in this repository: Oracle Linux guests on libvirt, everything
+declared in the `Vagrantfile`, and a `./lab` helper that sequences the steps that
+need more than one node.
 
 ```
                      lab network 10.60.1.0/24
-   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐      ┌──────────────┐
-   │   ceph1      │   │   ceph2      │   │   ceph3      │      │   client     │
-   │ .11          │   │ .12          │   │ .13          │      │ .21          │
-   │ MON  MGR     │   │ MON  MGR     │   │ MON          │      │              │
-   │ MDS  OSD×2   │   │ MDS  OSD×2   │   │      OSD×2   │      │ ceph-fuse    │
-   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘      └──────┬───────┘
-          │ 8 GB + 8 GB      │ 8 GB + 8 GB      │ 8 GB + 8 GB          │
-          │ local disks      │ local disks      │ local disks          │
-          └──────────────────┴──────────────────┴──────────────────────┘
-                     CephFS: / mounted from ceph1,ceph2,ceph3
+   ┌────────────────┐   ┌────────────────┐   ┌────────────────┐
+   │     ceph1      │   │     ceph2      │   │     ceph3      │
+   │  10.60.1.11    │   │  10.60.1.12    │   │  10.60.1.13    │
+   │ MON  MGR       │   │ MON  MGR       │   │ MON            │
+   │ MDS  OSD×2     │   │ MDS  OSD×2     │   │      OSD×2     │
+   └───────┬────────┘   └───────┬────────┘   └───────┬────────┘
+           │ 8 GB + 8 GB        │ 8 GB + 8 GB        │ 8 GB + 8 GB
+           └────────────────────┴────────────────────┘
+                     CephFS  (MDS on ceph1/ceph3)
+                          │              │
+              ┌───────────┴───┐      ┌───┴───────────┐
+              │   client1     │      │   client2     │
+              │  10.60.1.21   │      │  10.60.1.22   │
+              │  ceph-fuse    │      │  ceph-fuse    │
+              └───────────────┘      └───────────────┘
 ```
 
 ## What gets built
@@ -25,14 +30,14 @@ than one node.
 | Component | Implementation |
 |-----------|----------------|
 | Servers | `ceph1`, `ceph2`, `ceph3`: Oracle Linux 9, 4 GB and 2 vCPU each, one lab interface plus the libvirt management interface |
-| Client | `client`: Oracle Linux 9, 2 GB and 1 vCPU, mounts the file system with `ceph-fuse` |
+| Clients | `client1`, `client2`: Oracle Linux 9, 2 GB and 1 vCPU each, mount the file system with `ceph-fuse` (add or remove them with `CEPH_LAB_CLIENTS`) |
 | Deployment | `cephadm` (Ceph Squid, 19.2.x) with every daemon in a rootful podman container managed through `ceph orch` |
 | Monitors | 3, one per server: a quorum survives the loss of any single server |
 | Managers | 2: one active, one standby, for the dashboard, the orchestrator and the volumes module |
 | OSDs | 6: two 8 GB disks per server, BlueStore, one OSD per disk |
 | Data protection | Pool size 3, `min_size` 2, CRUSH failure domain `host` — the cluster stays writable with one server down |
 | CephFS | `cephfs` file system: `cephfs_metadata` + `cephfs_data` pools, one active and one standby MDS |
-| Client access | `client.cephfs` CephX key with `rwps` on `/`, mounted on `/mnt/cephfs` by `ceph-fuse` and kept across reboots by `/etc/fstab` |
+| Client access | one CephX user per client (`client.client1`, `client.client2`) with `rwps` on `/`, each mounted on `/mnt/cephfs` by `ceph-fuse` and kept across reboots by `/etc/fstab` |
 | Time sync | `chronyd` on every node; the VMs share the host clock, so no external NTP is needed for a lab |
 
 Capacity is 6 × 8 GB raw, 16 GB usable with size 3. That is enough to show
@@ -45,12 +50,13 @@ point of a lab.
   (`vagrant plugin install vagrant-libvirt`; needs `libvirt-dev`, `libxml2-dev`,
   `zlib1g-dev`, `libxslt1-dev` and a compiler to build the plugin).
   Nothing on the host needs **sudo**: this lab has no iSCSI target.
-* ~14 GB RAM free (3 × 4 GB + 2 GB) and ~40 GB disk for the sparse OSD volumes.
+* ~16 GB RAM free (3 × 4 GB + 2 × 2 GB) and ~40 GB disk for the sparse OSD
+  volumes. `CEPH_LAB_CLIENTS` sets how many client VMs are built (default 2).
 * **Internet access from the guests.** Ceph is no longer shipped in Oracle
   Linux's own repositories and cephadm runs containers, so the provisioning
   downloads two things:
   * the `ceph-common`, `cephadm`, `podman` and `ceph-fuse`/`attr` RPMs from
-    `download.ceph.com` — about 100 MB per server, 30 MB for the client;
+    `download.ceph.com` — about 100 MB per server, 30 MB per client;
   * the Ceph container image (`quay.io/ceph/ceph:v19.2.x`, ~490 MB to download,
     ~1.4 GB on disk) on every server, pulled by cephadm the first time it starts
     a daemon.
@@ -73,9 +79,9 @@ CEPH_LAB_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ceph ./lab up
 
 ```bash
 cd cephfs
-./lab up        # four provisioned VMs (~10 min)
+./lab up        # five provisioned VMs (ceph1-3, client1, client2)
 ./lab cluster   # bootstrap, monitors, managers, OSDs, MDS pair, CephFS (~5-25 min)
-./lab client    # join the client VM and mount /mnt/cephfs
+./lab client    # join both client VMs and mount /mnt/cephfs on each
 ./lab status    # cluster health, daemons, placement groups, mount state
 ```
 
@@ -86,9 +92,9 @@ Then poke at it:
 ```bash
 ./lab ceph -s                       # cluster summary
 ./lab ceph fs status cephfs         # MDS ranks and the file system's pools
-./lab df                            # pool usage and the client's mount
+./lab df                            # pool usage and both client mounts
 ./lab shell                         # cephadm shell on ceph1 for ad-hoc ceph/rados commands
-./lab ssh client                    # df -h /mnt/cephfs, write files, ...
+./lab ssh client2                   # df -h /mnt/cephfs, write files, ...
 ```
 
 The dashboard is at `https://10.60.1.11:8443` with `admin` /
@@ -101,7 +107,7 @@ The dashboard is at `https://10.60.1.11:8443` with `admin` /
 |------|--------|--------------|
 | `base` | `scripts/01-base.sh` | Host name, `/etc/hosts` for all four nodes, the 10.60.1.0/24 interface, SELinux permissive and firewalld off, journal size cap, `chronyd`, the Ceph package repository, `ceph-common`/`cephadm`/`podman`/`lvm2` (plus `ceph-fuse` on the client), the shared lab SSH key and passwordless root SSH between the nodes |
 | `cluster` | `scripts/02-cluster.sh` | Runs on `ceph1`: `cephadm bootstrap`, hands the cephadm public key to the other servers, adds them as cluster hosts with the `_admin` label, spreads the monitors, places two managers, `ceph orch apply osd --all-available-devices`, creates the CephFS pools and the file system, deploys two MDS daemons and authorises `client.cephfs` |
-| `client` | `scripts/03-client.sh` | Runs on `client`: pulls `ceph.conf` and the keyring from `ceph1`, mounts `/mnt/cephfs` with `ceph-fuse`, adds the `/etc/fstab` entry and does a write/read round trip |
+| `client` | `scripts/03-client.sh` | Runs on each client (`./lab client client2` for one): pulls `ceph.conf` and its own keyring from `ceph1`, mounts `/mnt/cephfs` with `ceph-fuse`, adds the `/etc/fstab` entry and does a write/read round trip |
 | `status` | `scripts/04-status.sh` | Read-only report for any node; on the cluster nodes it shows hosts, daemons, OSD tree, CephFS and capacity, on the client the mount and the file system status |
 
 `base` runs during `vagrant up`; `cluster` and `client` need every node up (and
@@ -167,23 +173,31 @@ ceph orch apply mds cephfs --placement="2 ceph1 ceph2 ceph3"
 MDS (`./lab crash ceph1`, or `systemctl restart` on that MDS) hands the rank to
 the standby in seconds, with no client-visible outage beyond a short stall.
 
-### The client
+### The clients
 
 `ceph-fuse` talks to the monitors once to get the map and then to the OSDs
-directly, so the client only needs the monitor list and a key:
+directly, so a client only needs the monitor list and a key:
 
 ```
-ceph1,ceph2,ceph3:/ /mnt/cephfs fuse.ceph ceph.id=cephfs,ceph.conf=/etc/ceph/ceph.conf,_netdev,defaults 0 0
+ceph1,ceph2,ceph3:/ /mnt/cephfs fuse.ceph ceph.id=client1,ceph.conf=/etc/ceph/ceph.conf,_netdev,defaults 0 0
 ```
 
-The key (`client.cephfs`) is scoped to the file system's path and has no
-`mon`/`osd` administrative caps, which is why `ceph -s` works on the client but
-`ceph osd tree` does not. Administrative commands run on `ceph1`, where cephadm
-bootstrapped the admin keyring.
+Each client has its own CephX user — `client.client1` on `client1`,
+`client.client2` on `client2` — so `ceph fs status` counts two clients and the
+MDS keeps a session per mount, and revoking one does not disturb the other.
+(`ceph fs status` sometimes counts one more: the mgr `volumes` module mounts the
+file system itself to create subvolume directories.) The key is scoped to the file system's
+path and has no `mon`/`osd` administrative caps, which is why `ceph -s` works on
+a client but `ceph osd tree` does not. Administrative commands run on `ceph1`,
+where cephadm bootstrapped the admin keyring.
 
 The `rwps` caps matter for the demo: `s` is the snapshot right, and without it
 creating `/mnt/cephfs/.../.snap/<name>` fails with `EACCES` no matter what the
 directory mode says.
+
+Both clients mount the same file system, so a file written on one is visible on
+the other with the same inode — `./lab demo` shows that, and it is the whole
+point of a clustered file system.
 
 ### Why the client mounts with ceph-fuse
 
@@ -210,8 +224,11 @@ defaults and lets the userspace client do the talking.
 
 ## Demo commands
 
-`./lab demo` walks through the four things CephFS is usually chosen for:
+`./lab demo` walks through the things CephFS is usually chosen for:
 
+* **shared files** — `client1` writes `/mnt/cephfs/demo/shared.txt`, `client2`
+  reads it back with the same inode, and the active MDS shows one session per
+  mount (`client1` and `client2`, both on `/mnt/cephfs`).
 * **snapshots** — `mkdir /mnt/cephfs/demo/snap/.snap/before-edit` creates a
   read-only view of that directory; the demo edits the file, reads the snapshot
   copy and restores it.
@@ -244,9 +261,12 @@ cluster backfills when the node returns. `./lab crash ceph1` also takes the
 active MDS and the dashboard with it — the standby MDS picks up the rank.
 
 For a graceful stop of a single node's daemons, use `./lab stop ceph2` and
-`./lab start ceph2`; `./lab halt` stops all four VMs with the disks intact, and
+`./lab start ceph2`; `./lab halt` stops all five VMs with the disks intact, and
 `./lab up` brings the cluster back (every daemon is a systemd unit enabled on
-boot).
+boot, and the clients mount from `/etc/fstab` through `remote-fs.target`).
+
+Killing a client (`./lab crash client1`) is harmless by design: the MDS notices
+the session goes away, and `./lab recover client1` brings the mount back.
 
 ## Limitations of this lab
 
@@ -285,7 +305,8 @@ view from `client` without changing anything.
 | `ceph -s` on the client says `EACCES` | `client.cephfs` is deliberately not an admin key; use `./lab ceph` on `ceph1` |
 | Health warning `clock skew` | the VMs share the host clock; `chronyc tracking` shows whether NTP is reachable |
 | Health warning after `./lab bench` | the `bench` pool is left behind with its application tag; remove it with `./lab ceph osd pool rm bench bench --yes-i-really-really-mean-it` |
-| a provisioning step has to be re-run | `./lab provision ceph1 base` (or `cluster`, `client`, `status`) |
+| a provisioning step has to be re-run | `./lab provision ceph1 base` (or `cluster`, `client`, `status`); `./lab client client2` re-joins one client |
+| the second client cannot mount | `./lab ceph auth get client.client2` must exist (re-run `./lab cluster`), and `./lab client client2` pulls its keyring again |
 
 Logs for one node: `./lab logs ceph2` (the last 100 lines of the Ceph daemon
 units), or `./lab ssh ceph2` followed by `sudo podman logs ceph-<fsid>-osd-2`.

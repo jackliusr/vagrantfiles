@@ -17,11 +17,16 @@ load_lab_env
 : "${LAB_NODE:?LAB_NODE is not set}"
 : "${LAB_ROLE:?LAB_ROLE is not set}"
 : "${LAB_FS_NAME:?LAB_FS_NAME is not set}"
-: "${LAB_CLIENT_USER:?LAB_CLIENT_USER is not set}"
 : "${LAB_BOOTSTRAP_HOST:?LAB_BOOTSTRAP_HOST is not set}"
 : "${LAB_SERVERS:?LAB_SERVERS is not set}"
 
-[ "$LAB_ROLE" = client ] || die "03-client.sh configures the client, not a $LAB_ROLE"
+[ "$LAB_ROLE" = client ] || die "03-client.sh configures a client, not a $LAB_ROLE"
+
+# Each client has its own CephX user (client.client1, client.client2, ...), which
+# 02-cluster.sh creates; the keyring name follows Ceph's convention of
+# /etc/ceph/<cluster>.client.<id>.keyring.
+ENTITY=$(client_entity)
+KEYRING="$CEPH_CONF_DIR/ceph.$ENTITY.keyring"
 
 cluster_up() { lab_ssh "$LAB_BOOTSTRAP_HOST" ceph -s >/dev/null 2>&1; }
 
@@ -35,10 +40,9 @@ log "Installing the cluster configuration and the CephFS keyring"
 # needed.
 install -d -m 0755 "$CEPH_CONF_DIR"
 lab_ssh "$LAB_BOOTSTRAP_HOST" "ceph config generate-minimal-conf" > "$CEPH_CONF_DIR/ceph.conf"
-lab_ssh "$LAB_BOOTSTRAP_HOST" "ceph auth get client.$LAB_CLIENT_USER" \
-  > "$CEPH_CONF_DIR/ceph.client.$LAB_CLIENT_USER.keyring"
+lab_ssh "$LAB_BOOTSTRAP_HOST" "ceph auth get $ENTITY" > "$KEYRING"
 chmod 0644 "$CEPH_CONF_DIR/ceph.conf"
-chmod 0600 "$CEPH_CONF_DIR/ceph.client.$LAB_CLIENT_USER.keyring"
+chmod 0600 "$KEYRING"
 info "monitors: $(grep -E '^[[:space:]]*mon_host' "$CEPH_CONF_DIR/ceph.conf" | cut -d= -f2-)"
 
 log "Mounting $LAB_FS_NAME on $LAB_MOUNT"
@@ -51,7 +55,7 @@ sed -i "/^${FSTAB_BEGIN}$/,/^${FSTAB_END}$/d" /etc/fstab
 {
   echo "$FSTAB_BEGIN"
   printf '%s:/ %s fuse.ceph ceph.id=%s,ceph.conf=%s/ceph.conf,_netdev,defaults 0 0\n' \
-    "$(mon_list)" "$LAB_MOUNT" "$LAB_CLIENT_USER" "$CEPH_CONF_DIR"
+    "$(mon_list)" "$LAB_MOUNT" "${ENTITY#client.}" "$CEPH_CONF_DIR"
   echo "$FSTAB_END"
 } >> /etc/fstab
 # A _netdev entry is pulled in by remote-fs.target, and this box ships that
@@ -72,7 +76,7 @@ rm -f "$probe"
 
 # The client key has no manager caps, so `ceph fs status` is refused here; the
 # file system list is the most an ordinary client may ask for.
-ceph -n "client.$LAB_CLIENT_USER" fs ls 2>/dev/null | sed 's/^/    /' || true
+ceph -n "$ENTITY" fs ls 2>/dev/null | sed 's/^/    /' || true
 
 save_lab_env
 mark_done client

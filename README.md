@@ -13,7 +13,7 @@ the larger labs wrap the common commands in a `./lab` helper.
 | [dr-oracle](dr-oracle/) | Oracle 19c disaster-recovery lab: two data centres, each with its own iSCSI SAN array emulated by `targetcli`, block-replicated between the sites with DRBD (SRDF/SnapMirror/ActiveDR style) | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`10` via `./lab` |
 | [rhel-ha-oracle](rhel-ha-oracle/) | Two-node Red Hat HA cluster (Pacemaker + Corosync + `pcs`) with SBD fencing and an Oracle 19c single instance on shared iSCSI storage | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`07` via `./lab` |
 | [vcs-oracle](vcs-oracle/) | Two-node Veritas InfoScale (VCS) cluster with VXFEN I/O fencing and an Oracle 19c single instance on PR-capable iSCSI LUNs | libvirt/QEMU, `generic/oracle8` | Bundled shell steps `01`–`08` via `./lab` |
-| [cephfs](cephfs/) | Ceph File System cluster lab: three nodes with three monitors, two managers, six OSDs and an active/standby MDS pair serving a CephFS volume to a fourth VM over the kernel client | libvirt/QEMU, `generic/oracle9` | Bundled shell steps `01`–`04` via `./lab` |
+| [cephfs](cephfs/) | Ceph File System cluster lab: three nodes with three monitors, two managers, six OSDs and an active/standby MDS pair serving one CephFS volume to two client VMs | libvirt/QEMU, `generic/oracle9` | Bundled shell steps `01`–`04` via `./lab` |
 | [oracle-11g](oracle-11g/) | Single-node Oracle Database 11g R2 installation | VirtualBox, `boxcutter/oel66` | Puppet (`manifests/base.pp`, `oracle` module) |
 | [chef-workstation](chef-workstation/) | ChefDK workstation with `vim` | VirtualBox, `hashicorp/precise64` | `setupChefDk.sh` |
 | [puppet-template](puppet-template/) | Puppet walkthrough that pulls a module from Puppet Forge and installs Elasticsearch | VirtualBox, `ubuntu/trusty64` | `apt-update.sh`, `install-puppet-modules.sh`, Puppet |
@@ -47,7 +47,7 @@ separate step.
 `cephfs` has no host-side storage to set up and needs no sudo on the host, but
 its guests do need internet access: the Ceph RPMs come from `download.ceph.com`
 and cephadm pulls the Ceph container image from `quay.io`. See
-[cephfs/README.md](cephfs/README.md) for the 14 GB / 40 GB sizing.
+[cephfs/README.md](cephfs/README.md) for the 16 GB / 40 GB sizing.
 
 ### rhel-ha-oracle
 
@@ -97,18 +97,18 @@ In both labs `./lab` also supports `ssh [node]`, `provision NODE STEP`,
 Ceph's own distributed file system: three Oracle Linux 9 nodes run three
 monitors, two managers and six OSDs (two 8 GB disks each, size 3 pools with the
 host as the CRUSH failure domain), and one active plus one standby MDS serve a
-`cephfs` volume. A fourth VM mounts it on `/mnt/cephfs` with `ceph-fuse` (the
-9.3 kernel client cannot read Squid's default `aes256k` cephx keys), so the
-difference between the cluster, the file system and its consumers is visible as
-three separate machines.
+`cephfs` volume. Two client VMs mount it on `/mnt/cephfs` with `ceph-fuse` (the
+9.3 kernel client cannot read Squid's default `aes256k` cephx keys), each with
+its own CephX user, so the difference between the cluster, the file system and
+its consumers is visible as separate machines.
 
 ```bash
 cd cephfs
-./lab up        # four provisioned VMs (~10 min)
+./lab up        # five provisioned VMs (ceph1-3, client1, client2)
 ./lab cluster   # cephadm bootstrap, mons, mgrs, OSDs, MDS pair, CephFS
-./lab client    # join the client VM and mount /mnt/cephfs
+./lab client    # join both clients and mount /mnt/cephfs on each
 ./lab status    # health, daemons, PGs, OSD tree, mount state
-./lab demo      # snapshots, quotas, subvolumes, self-healing
+./lab demo      # shared files, snapshots, quotas, subvolumes, self-healing
 ./lab crash ceph2   # lose a node; writes keep working
 ./lab recover ceph2 # and heal
 ```

@@ -19,11 +19,11 @@ load_lab_env
 : "${LAB_ROLE:?LAB_ROLE is not set}"
 : "${LAB_IP:?LAB_IP is not set}"
 : "${LAB_FS_NAME:?LAB_FS_NAME is not set}"
-: "${LAB_CLIENT_USER:?LAB_CLIENT_USER is not set}"
 : "${LAB_BOOTSTRAP_HOST:?LAB_BOOTSTRAP_HOST is not set}"
 : "${LAB_PUBLIC_NETWORK:?LAB_PUBLIC_NETWORK is not set}"
 : "${LAB_DASHBOARD_PASSWORD:?LAB_DASHBOARD_PASSWORD is not set}"
 : "${LAB_SERVERS:?LAB_SERVERS is not set}"
+: "${LAB_CLIENTS:?LAB_CLIENTS is not set}"
 
 [ "$LAB_ROLE" = server ] || die "02-cluster.sh configures a Ceph server, not a $LAB_ROLE"
 [ "$LAB_NODE" = "$LAB_BOOTSTRAP_HOST" ] \
@@ -167,12 +167,16 @@ log "Waiting for the file system to settle"
 wait_until 300 "every placement group to be active+clean" pgs_clean \
   || info "the placement groups are still moving; ./lab status shows the rest"
 
-log "Authorising the client user client.$LAB_CLIENT_USER"
+log "Authorising one CephX user per client node"
 # rwps = read, write, layout and snapshot rights on the whole tree. The snapshot
-# right is what lets the client create .snap directories; without it the
-# snapshot part of ./lab demo fails with EACCES.
-ceph fs authorize "$LAB_FS_NAME" "client.$LAB_CLIENT_USER" / rwps >/dev/null 2>&1
-info "client.$LAB_CLIENT_USER may read, write and snapshot the whole $LAB_FS_NAME tree"
+# right is what lets a client create .snap directories; without it the snapshot
+# part of ./lab demo fails with EACCES. Both clients get the same caps but a
+# separate identity, so they show up as two clients in `ceph fs status`.
+for spec in $(client_nodes); do
+  name=${spec%%:*}
+  ceph fs authorize "$LAB_FS_NAME" "$(client_entity "$name")" / rwps >/dev/null 2>&1
+  info "client.$name may read, write and snapshot the whole $LAB_FS_NAME tree"
+done
 
 log "Cluster ready"
 ceph -s

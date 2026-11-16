@@ -46,11 +46,13 @@ if [ "${LAB_ROLE:-}" = client ]; then
   section "CephFS status as seen by the client"
   # client.cephfs can read the cluster state but not use the manager, so this is
   # `ceph -s` and `ceph fs ls` rather than `ceph fs status`.
-  if ceph -n "client.$LAB_CLIENT_USER" -s >/dev/null 2>&1; then
-    ceph -n "client.$LAB_CLIENT_USER" -s | sed -n '1,11p' | sed 's/^/    /'
-    ceph -n "client.$LAB_CLIENT_USER" fs ls | sed 's/^/    /'
+  entity=$(client_entity)
+  if ceph -n "$entity" -s >/dev/null 2>&1; then
+    printf '    connecting as %s\n' "$entity"
+    ceph -n "$entity" -s | sed -n '1,11p' | sed 's/^/    /'
+    ceph -n "$entity" fs ls | sed 's/^/    /'
   else
-    printf '    no answer for client.%s (./lab client)\n' "${LAB_CLIENT_USER:-?}"
+    printf '    no answer for %s (./lab client)\n' "$entity"
   fi
   exit 0
 fi
